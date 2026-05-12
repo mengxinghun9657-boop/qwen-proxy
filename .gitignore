@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+.qwen_conversations.json
+qwen_config.json

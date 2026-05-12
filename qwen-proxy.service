@@ -1,0 +1,25 @@
+[Unit]
+Description=Qwen Proxy - OpenAI-compatible API for chat.qwen.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zxp
+Group=zxp
+WorkingDirectory=/opt/llm/qwen-proxy
+ExecStart=/opt/llm/qwen-proxy/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8800
+Restart=on-failure
+RestartSec=5
+
+# httpx doesn't support socks:// proxies — clear them
+Environment="ALL_PROXY="
+Environment="all_proxy="
+# HTTP proxy via clash-verge
+Environment="https_proxy=http://127.0.0.1:7897"
+Environment="HTTPS_PROXY=http://127.0.0.1:7897"
+Environment="http_proxy=http://127.0.0.1:7897"
+Environment="HTTP_PROXY=http://127.0.0.1:7897"
+
+[Install]
+WantedBy=multi-user.target

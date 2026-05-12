@@ -1,0 +1,7 @@
+{
+  "token": "YOUR_JWT_TOKEN_HERE",
+  "token_updated_at": "",
+  "notes": "From chat.qwen.ai browser DevTools -> Application -> Local Storage -> token",
+  "project_id": "",
+  "default_model": "qwen3.6-plus"
+}

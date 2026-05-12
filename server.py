@@ -75,8 +75,8 @@ async def chat_completions(request: Request):
             "msg_count": 0,
             "created_at": time.time(),
         }
-        # Auto-assign to project if configured
-        project_id = session.load_project_id()
+        # Auto-assign to project — request header overrides global config
+        project_id = request.headers.get("x-project-id") or session.load_project_id()
         if project_id:
             try:
                 await client.add_chat_to_project(chat_id, project_id)

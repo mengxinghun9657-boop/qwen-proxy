@@ -126,6 +126,7 @@ def ask(
     stream: bool = False,
     mode: Optional[str] = None,
     max_words: Optional[int] = None,
+    project_id: Optional[str] = None,
 ) -> tuple[str, str]:
     """Send a question to Qwen, return (response_text, server_conv_id)."""
     final_system = _build_system_prompt(system, mode, max_words)
@@ -146,6 +147,8 @@ def ask(
         server_conv_id = _get_conv(conv_id)
         if server_conv_id:
             headers["x-conversation-id"] = server_conv_id
+    if project_id:
+        headers["x-project-id"] = project_id
 
     try:
         with httpx.Client(timeout=300, http2=True) as client:
@@ -225,6 +228,7 @@ Examples:
     parser.add_argument("-M", "--mode", help="Compression preset (concise, diagnose, review, keypoints, judge, json)")
     parser.add_argument("-w", "--max-words", type=int, help="Max words in response")
     parser.add_argument("-c", "--conversation", help="Conversation ID for multi-turn")
+    parser.add_argument("-p", "--project", help="Qwen project ID to assign chat to")
     parser.add_argument("--stream", action="store_true", help="Stream output")
     parser.add_argument("--list-models", action="store_true", help="List available models")
     parser.add_argument("--list-modes", action="store_true", help="List compression modes")
@@ -266,6 +270,7 @@ Examples:
         stream=args.stream,
         mode=args.mode,
         max_words=args.max_words,
+        project_id=args.project,
     )
 
     if not args.stream:

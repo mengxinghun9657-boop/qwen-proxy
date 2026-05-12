@@ -1,0 +1,6 @@
+model:
+  default: "qwen3.6-plus"
+
+  # Use local Qwen reverse proxy (no API key needed)
+  provider: "custom"
+  base_url: "http://127.0.0.1:8800/v1"

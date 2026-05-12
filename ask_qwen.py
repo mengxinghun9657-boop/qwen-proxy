@@ -4,9 +4,10 @@
 Usage:
   python ask_qwen.py "your question"
   echo "question" | python ask_qwen.py
-  python ask_qwen.py -s "You are a code reviewer" "review this code"
+  python ask_qwen.py -M concise "quick question"
+  python ask_qwen.py -s "You are a debugger" -M diagnose "why does this crash?"
   python ask_qwen.py -c <conv_id> "follow-up question"
-  python ask_qwen.py -m qwen-max-preview "complex question"
+  python ask_qwen.py -m qwen3.6-max-preview -M review "code here"
   python ask_qwen.py --list-models
 
 Output: Qwen's response text to stdout.
@@ -25,6 +26,46 @@ import httpx
 
 PROXY_BASE = os.environ.get("QWEN_PROXY_URL", "http://127.0.0.1:8800")
 CONV_STORE = Path(__file__).parent / ".qwen_conversations.json"
+
+# ---------------------------------------------------------------------------
+# Compression presets — appended to system prompt to enforce compact output
+# Each preset is designed to minimize context bloat while keeping signal.
+# ---------------------------------------------------------------------------
+COMPRESSION_MODES = {
+    "concise": (
+        "Reply within 150 words. Lead with the conclusion. "
+        "Skip pleasantries and filler. If you must explain, use one sentence."
+    ),
+    "diagnose": (
+        "Output format:\n"
+        "ROOT CAUSE: <most likely cause, one line>\n"
+        "FIX: <one line fix>\n"
+        "ALT: <alternative cause if wrong>\n"
+        "Max 100 words total. No greetings, no explanations beyond the format."
+    ),
+    "review": (
+        "Output format:\n"
+        "## Critical\n- [issue] (severity: H/M/L)\n"
+        "## Warnings\n- [issue] (severity: H/M/L)\n"
+        "## Summary\nOne sentence.\n"
+        "Max 3 items per section. Max 200 words total."
+    ),
+    "keypoints": (
+        "Output exactly 3-5 bullet points. Each point <= 25 words. "
+        "No preamble, no closing summary, just the bullets."
+    ),
+    "judge": (
+        "Answer ONLY with:\n"
+        "DECISION: <YES/NO>\n"
+        "CONFIDENCE: <HIGH/MEDIUM/LOW>\n"
+        "REASON: <one sentence>\n"
+        "No other text."
+    ),
+    "json": (
+        "Output valid JSON only, no markdown fences, no other text. "
+        "Schema: {\"findings\": [...], \"suggestion\": \"...\", \"confidence\": \"high|medium|low\"}"
+    ),
+}
 
 
 def _load_conversations() -> dict:
@@ -61,17 +102,37 @@ def list_models() -> list[str]:
         return []
 
 
+def _build_system_prompt(
+    user_system: Optional[str],
+    mode: Optional[str],
+    max_words: Optional[int],
+) -> Optional[str]:
+    """Build final system prompt: user-provided + compression directive."""
+    parts = []
+    if user_system:
+        parts.append(user_system)
+    if mode and mode in COMPRESSION_MODES:
+        parts.append(COMPRESSION_MODES[mode])
+    if max_words:
+        parts.append(f"CRITICAL: Your entire response MUST be under {max_words} words.")
+    return "\n\n".join(parts) if parts else None
+
+
 def ask(
     prompt: str,
     system: Optional[str] = None,
     model: str = "qwen3.6-plus",
     conv_id: Optional[str] = None,
     stream: bool = False,
+    mode: Optional[str] = None,
+    max_words: Optional[int] = None,
 ) -> tuple[str, str]:
     """Send a question to Qwen, return (response_text, server_conv_id)."""
+    final_system = _build_system_prompt(system, mode, max_words)
+
     messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
+    if final_system:
+        messages.append({"role": "system", "content": final_system})
     messages.append({"role": "user", "content": prompt})
 
     body = {
@@ -135,22 +196,38 @@ def ask(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Ask Qwen via local proxy",
+        description="Ask Qwen via local proxy (with compression presets)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Examples:
+        epilog="""Compression modes:
+  concise   - 150 words max, conclusion first
+  diagnose  - Root cause + fix + alternative, 100 words
+  review    - Severity-tagged findings + summary, 200 words
+  keypoints - 3-5 bullets only, 25 words each
+  judge     - YES/NO decision + confidence + reason
+  json      - Structured JSON output
+
+Examples:
   python ask_qwen.py "explain this error"
-  echo "review this code" | python ask_qwen.py
-  python ask_qwen.py -s "You are a debugger" "why does this fail?"
-  python ask_qwen.py -c my-session "what about edge cases?"
-  python ask_qwen.py -m qwen-max-preview "complex analysis"
-  python ask_qwen.py --list-models""",
+  python ask_qwen.py -M concise "what is a bloom filter?"
+  python ask_qwen.py -M diagnose "why does this segfault?"
+  python ask_qwen.py -M review "review this code: $(cat bug.go)"
+  python ask_qwen.py -M judge "should I use Redis or Kafka for this?"
+  python ask_qwen.py -M json "analyze this SQL query"
+  python ask_qwen.py -w 50 "extremely short answer"
+  python ask_qwen.py -c debug -M diagnose "what else could cause this?"
+  python ask_qwen.py -m qwen3.6-max-preview -M review "complex code"
+  python ask_qwen.py --list-models
+  python ask_qwen.py --list-modes""",
     )
     parser.add_argument("prompt", nargs="?", help="Question to ask (or use stdin)")
-    parser.add_argument("-s", "--system", help="System prompt")
+    parser.add_argument("-s", "--system", help="System prompt (role definition)")
     parser.add_argument("-m", "--model", default="qwen3.6-plus", help="Model to use")
+    parser.add_argument("-M", "--mode", help="Compression preset (concise, diagnose, review, keypoints, judge, json)")
+    parser.add_argument("-w", "--max-words", type=int, help="Max words in response")
     parser.add_argument("-c", "--conversation", help="Conversation ID for multi-turn")
     parser.add_argument("--stream", action="store_true", help="Stream output")
     parser.add_argument("--list-models", action="store_true", help="List available models")
+    parser.add_argument("--list-modes", action="store_true", help="List compression modes")
     parser.add_argument("--raw", action="store_true", help="Output raw JSON response")
 
     args = parser.parse_args()
@@ -162,6 +239,11 @@ def main():
                 print(m)
         else:
             sys.exit(1)
+        return
+
+    if args.list_modes:
+        for name, desc in COMPRESSION_MODES.items():
+            print(f"  {name}: {desc.split(chr(10))[0]}")
         return
 
     # Get prompt from args or stdin
@@ -182,6 +264,8 @@ def main():
         model=args.model,
         conv_id=args.conversation,
         stream=args.stream,
+        mode=args.mode,
+        max_words=args.max_words,
     )
 
     if not args.stream:

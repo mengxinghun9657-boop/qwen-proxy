@@ -496,6 +496,7 @@ MIT
 
 ## 相关链接 / Links
 
+- [多模型协作实战测试](docs/multi-model-collaboration-case-study.md) — Claude Solo vs Claude+Qwen，Bug 发现率提升 75%
 - [chat.qwen.ai](https://chat.qwen.ai) — Qwen 官方聊天应用
 - [Qwen 模型家族](https://github.com/QwenLM/Qwen) — 开源模型
 - [OpenAI API 协议](https://platform.openai.com/docs/api-reference/chat) — 兼容参考

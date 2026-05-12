@@ -1,246 +1,147 @@
-# 我把 Qwen 变成 Claude Code 的副驾驶，一次代码审查多发现了2个隐藏 Bug
+# 让 Qwen 当 Claude Code 的副驾驶：三组对照实验
 
-> 真实的多模型协作实战：不是"哪个模型更强"，而是"它们如何互补"。
-
----
-
-## 背景
-
-上周在 review 团队一个头像上传服务的代码时，我决定做个实验。
-
-这个服务每天处理约 5 万次上传，4 个 gunicorn worker 部署在 nginx 后面。最近 on-call 收到两个投诉：
-
-- **峰值流量下偶发 502/504**（~200 并发上传时）
-- **部分用户上传新头像后不生效**，页面显示的仍是旧图
-
-代码不长，200 行。维护者是个称职的后端——有 auth 中间件、有健康检查、有错误处理、有日志。第一眼扫过去，代码质量不差。
-
-我做了两轮审查：
-
-1. **第 1 轮**：Claude Code 独立审查
-2. **第 2 轮**：Claude Code 调用 Qwen（qwen3.6-plus）作为副驾驶协同审查
-
-两轮结果对比，看协同是否真的有用。
+> 不是"哪个模型更强"，而是"它们漏的东西不一样"。
 
 ---
 
-## 被测代码（节选）
+## 我想搞清楚一件事
 
-为了可读性省略了 config dataclass 和 helper 函数，[完整代码在 GitHub](https://github.com/mengxinghun9657-boop/qwen-proxy)。
+在多模型协作中，副驾驶到底是在帮忙还是在添乱？回答这个问题不能靠直觉。
 
-```python
-"""
-Avatar upload service. Handles ~50k uploads/day,
-deployed with 4 gunicorn workers behind nginx.
-"""
-engine = create_engine(
-    config.DATABASE_URL,
-    pool_size=8, max_overflow=4,
-    pool_pre_ping=True, pool_recycle=3600,
-)
-
-@app.before_request
-def authenticate():
-    """Validate Bearer token, attach user_id to g."""
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
-    with Session(engine) as db:
-        row = db.execute(
-            text("SELECT id, status FROM users WHERE api_token = :token"),
-            {"token": token},
-        ).fetchone()
-    if row is None:
-        return jsonify({"error": "invalid token"}), 401
-    g.user_id = str(row[0])
-
-@app.route("/upload", methods=["POST"])
-def upload_avatar():
-    file = request.files["file"]
-
-    # Validate content-type from client (not magic bytes)
-    if file.content_type not in config.ALLOWED_CONTENT_TYPES:
-        return jsonify({"error": "unsupported type"}), 400
-
-    # Read entire file into memory for validation
-    file_data = file.read()
-    if len(file_data) > config.MAX_FILE_SIZE:
-        return jsonify({"error": "file too large"}), 413
-
-    # Build paths & persist
-    safe_uid = secure_filename(g.user_id)
-    filename = f"{uuid.uuid4().hex}.{ext}"
-    filepath = os.path.join(config.UPLOAD_DIR, safe_uid, filename)
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "wb") as f:
-        f.write(file_data)
-
-    # Verify, hash, update DB
-    file_hash = compute_hash(filepath)
-    with Session(engine) as db:
-        db.execute(text("UPDATE users SET avatar_url = :url, ..."), {...})
-        db.commit()
-
-    # Fire CDN purge and forget about the result
-    purge_cdn(f"/avatars/{safe_uid}/*")
-
-    return jsonify({"url": cdn_url, "hash": file_hash}), 201
-```
+我设计了三组对照实验：同一段代码，两组审查——Claude 独立一次，Claude+Qwen 协同一次。比较结果，看 Qwen 是否能稳定贡献 Claude 遗漏的东西，同时控制噪音。
 
 ---
 
-## 第 1 轮：Claude Code 独立审查
+## 实验设计
 
-Claude 独立阅读了完整代码后，找到了 **7 个问题**：
+**测试用例**：三个不同复杂度级别的 Python 头像上传服务。代码由我自己编写，在写的时候**刻意植入了我知道的 bug**，涵盖了安全、并发、数据一致性、运维四个维度。
 
-| # | 发现 | 与线上症状的关联 |
-|---|------|------------------|
-| 1 | **DB 连接池配置偏小** — `pool_size=8` 对 4 worker + 每请求 2 session（auth + upload），峰值时连接不够 | → 502/504 |
-| 2 | **`file.read()` 全量读入内存** — 10MB 上限 × 多并发 = 内存压力和 GC 抖动 | → 502 |
-| 3 | **CDN purge 返回值被忽略** — `purge_cdn()` 返回 `bool` 但调用处不检查，purge 失败用户也收到 201 | → 头像不更新 |
-| 4 | **文件写入与 DB 更新无事务边界** — 文件落盘后 DB 更新失败时，产生孤儿文件 | → 磁盘泄漏 |
-| 5 | **Content-Type 可伪造** — `file.content_type` 来自客户端请求头，无扩展名/magic bytes 校验做纵深防御 | → 安全隐患 |
-| 6 | **健康检查有副作用** — `os.makedirs(upload_dir)` 在只读检查中修改文件系统 | → 轻微 |
-| 7 | **并发上传同一用户时文件竞态** — 两个请求各写一个文件，最后一个写 DB 的生效，另一个变孤儿 | → 磁盘泄漏 |
+这一点需要坦白：测试用例不是从真实生产环境取样的，而是我构造的。这意味着 bug 的分布可能带有我的个人偏见。不过实验的核心问题——"两个模型的发现是否互补"——并不依赖测试用例的来源，因为实验对比的是两组审查之间的差异，而非代码本身的好坏。
 
-其中 #1 和 #2 指向 502/504，#3 指向头像不更新。分析方向是对的，但我隐约觉得 504 的解释还不够彻底——连接池偏小和内存压力是叠加因素，但不是**根本瓶颈**。
+**两个审查通道：**
+
+| 通道 | 方式 |
+|------|------|
+| Claude Solo | 我独立阅读代码，列出全部发现 |
+| Claude + Qwen | 我先独立分析，然后通过 `ask_qwen.py -M review` 调用 Qwen（qwen3.6-plus），它的回复并入我的分析，标记哪些是它独自发现的 |
+
+**控制变量：**
+- 两次审查使用完全相同的代码
+- Qwen 使用 `-M review` 模式（压缩输出：按严重度分段，≤200 词）
+- Qwen 的系统提示词定向到特定角色（SRE 视角 / 安全工程师视角）
 
 ---
 
-## 第 2 轮：Claude + Qwen 协同审查
+## 测试用例
 
-这次我调用 Qwen 作为副驾驶，使用压缩模式 `-M review` + 系统提示词定向到 SRE 视角：
+### V1：基础版（90 行）
+
+一个最简的 Flask 上传接口——没有中间件、没有数据库、没有异步任务。Flask dev server 兜底。
+
+### V2：生产版（220 行）
+
+加入了 SQLAlchemy、auth 中间件、健康检查、连接池配置。模拟了一个称职工程师写的服务。
+
+### V3：复杂生产版（223 行）
+
+在 V2 基础上进一步加入 Celery 异步任务队列、Redis 缓存层、Prometheus metrics、存储配额管理。看起来像一个真实的生产服务。
+
+完整代码见 [GitHub](https://github.com/mengxinghun9657-boop/qwen-proxy/tree/main/docs)。
+
+---
+
+## 结果
+
+| | V1 (基础) | V2 (生产) | V3 (复杂生产) |
+|---|:------:|:------:|:---------:|
+| Claude Solo 发现 | 4 | 7 | 12 |
+| Qwen 额外发现 | +3 | +2 | +2 |
+| 协作总发现 | 7 | 9 | 14 |
+| 提升幅度 | +75% | +29% | +17% |
+| Qwen 噪音（无价值输出） | 0 | 0 | 0 |
+
+**Qwen 漏掉了什么 Claude 抓到的：**
+
+在 V3 中，Claude 发现了 `query_avatar_from_db` 是一个返回 `None` 的桩函数——这意味着 Redis 是唯一的数据存储，一旦重启，所有头像元数据永久丢失。**这是整个实验中最致命的 bug**，但 Qwen 完全没提。Qwen 的注意力集中在安全漏洞和网络层交互上（路径穿越、CDN 速率限制、polyglot 文件攻击），而 Claude 的注意力涵盖了数据层的设计缺陷。
+
+**Claude 漏掉了什么 Qwen 抓到的：**
+
+三组实验中，Qwen 持续发现了两类 Claude 容易漏的东西：
+
+1. **系统交互的边际效应** — CDN purge 同步阻塞请求路径（V2）、每次上传对用户目录做通配符 purge 导致 CDN 速率限制（V3）
+2. **安全纵深防御的细节** — magic bytes 校验缺失（V3）、cache-busting 参数缺失（V2）
+
+---
+
+## Qwen 额外发现详览
+
+| 测试 | Qwen 发现 | Claude 为什么漏了 |
+|------|-----------|-------------------|
+| V1 | 磁盘无清理逻辑会满 | 注意力在代码正确性上 |
+| V1 | `compute_hash` 二次读文件阻塞 I/O | 同上 |
+| V1 | 缺少 DB 更新导致前端不知道新 URL | 注意力在 CDN purge 的单点失败上 |
+| V2 | **CDN purge 在请求路径中同步阻塞** | 致命漏判——注意力在"purge 有没有执行"而非"purge 在哪里执行" |
+| V2 | URL 缺少 cache-busting 参数 | 对 CDN 缓存传播机制不够敏感 |
+| V3 | 每次上传对整目录通配符 purge = CDN 自 Dos | 注意力在单个请求的正确性而非全局副作用 |
+| V3 | 无 magic bytes 校验 = polyglot 文件可绕过 | 对文件上传安全细节的纵深防御意识不足 |
+
+---
+
+## 噪音控制
+
+多模型协作的真实风险不是"副驾驶不够聪明"，而是"副驾驶话太多"。如果每次调用 Qwen 都返回 500 字客套话+免责声明+重复内容，那上下文会被迅速污染。
+
+`-M review` 压缩模式在三组实验中始终将 Qwen 的输出控制在 150-200 词内，零寒暄、零免责声明、零"希望这对你有帮助"。
+
+这比发现数字更重要——**信噪比如果不守住，协作就是负收益。**
+
+---
+
+## 坦白交代——这个实验的局限
+
+1. **测试用例是我自己写的**：这不可避免地引入了我的个人偏见。我在写代码时知道的 bug，可能在分析时更容易发现。更严谨的实验应该使用第三方代码（如开源项目中的历史 bug 修复 commit）。
+
+2. **不是盲测**：我在调用 Qwen 之前已经完成了自己的分析，这会影响我对 Qwen 输出的评价。更严谨的设计应该是先调 Qwen 再看代码，或者请第三方评审。
+
+3. **样本量太小**：三组测试远不足以得出统计结论。这是一个定性探索，不是定量研究。
+
+4. **Claude 和我不是同一个实体**：我的"独立分析"本质上是人类+Claude 的混合，Qwen 的加入是在这个基础上叠加了一层。这里没有纯净的"A/B 测试"。
+
+---
+
+## 尽管如此，数据仍然指向一个清晰的方向
+
+三组实验中，Qwen 每次都能额外贡献 2-3 个 Claude 没发现的问题，同时零噪音。
+
+两个模型的注意力分布有明显的互补特征：
+
+- **Claude 的强项**：数据一致性、代码逻辑正确性、框架使用方式
+- **Qwen 的强项**：系统间的边际效应、网络安全细节、外部依赖的行为边界
+
+**如果你在做复杂系统的代码审查，让另一个模型看一眼是值得的。** 它不一定会比你看得更深，但它几乎一定会看到你看不到的角度。
+
+---
+
+## 这套工具怎么用
+
+[qwen-proxy](https://github.com/mengxinghun9657-boop/qwen-proxy) 提供了基础设施：
+
+- **反代服务** (`server.py`)：将 Qwen 内部 API 转译为 OpenAI 兼容协议
+- **CLI 工具** (`ask_qwen.py`)：6 种压缩预设，控制副驾驶输出
+- **决策框架** (Skill)：何时该调、何时跳过、如何后处理
 
 ```bash
-./venv/bin/python ask_qwen.py \
-  -M review \
-  -s "You are a senior SRE reviewing production Python code.
-      Focus on issues that explain the reported symptoms:
-      occasional 502/504 under peak load (200 concurrent uploads),
-      and avatars not updating after successful upload.
-      The service runs with 4 gunicorn workers behind nginx." \
-  "$(cat avatar_service.py)"
+# 快速协作
+./venv/bin/python ask_qwen.py -M review "$(cat your_code.py)"
 ```
-
-`-M review` 自动注入输出约束：按 Critical/Warnings/Summary 三段输出，每段最多 3 条，总字数 ≤200。
-
-Qwen 的完整回复：
-
-```
-## Critical
-- **DB Connection Pool Exhaustion** (severity: H): pool_size=8 with 4
-  workers allows only 2 concurrent DB connections per worker. Auth +
-  Upload queries block under 200 concurrent requests, causing connection
-  timeouts and 502s.
-- **Synchronous CDN Purge in Request Path** (severity: H): Blocking
-  requests.post (up to 1.5s) during upload drastically reduces worker
-  throughput. Under load, all 4 workers stall waiting for CDN, triggering
-  nginx 504 gateways.
-- **Stale Avatar Reads (Race Condition)** (severity: M): Purging happens
-  *after* DB commit. Without cache-busting query params on the URL,
-  clients/CDN may serve stale cached assets despite the DB update,
-  causing "avatar not updating" symptoms.
-
-## Warnings
-- **Memory Spike from file.read()** (severity: M): Loading entire 10MB
-  files into memory before writing causes high RAM usage and GC pressure
-  under concurrency, risking OOM or swap thrashing.
-- **Orphaned Files on DB Failure** (severity: L): If DB update fails,
-  the uploaded file remains on disk. Over time, this leaks storage.
-
-## Summary
-Increase DB pool size, offload CDN purging to a background task/queue,
-and add cache-busting parameters to avatar URLs to resolve latency
-spikes and consistency issues.
-```
-
-Qwen 额外发现了 **2 个 Claude 漏掉的问题**：
-
-| # | 发现 | 为什么 Claude 漏了 |
-|---|------|---------------------|
-| 8 | **CDN purge 同步阻塞请求路径** — `requests.post` 在请求线程中等 1.5s，4 个 worker 全被 CDN 响应阻塞时，nginx 收不到回复 → 504 | 注意力放在了代码正确性上，忽略了吞吐量瓶颈——**阻塞点在哪里比阻塞什么更重要** |
-| 9 | **URL 缺少 cache-busting 参数** — 即使 purge 成功，CDN 不同边缘节点的缓存时间差也可能导致部分用户看到旧内容 | 对 CDN 缓存传播机制的细节不够敏感 |
-
-同时，对于 #3（CDN purge 失败），Qwen 的分析比 Claude 更深——不只说"返回值被忽略"，而是指出**即使 purge 成功**，没有 cache-busting 参数仍可能导致旧内容被边缘节点缓存。
-
----
-
-## 完整对比
-
-| 指标 | Claude Solo | Claude + Qwen | 提升 |
-|------|:-----------:|:-------------:|:----:|
-| 发现问题数 | 7 | **9** | **+29%** |
-| 504 根因覆盖 | 连接池 + 内存 | 连接池 + 内存 **+ 同步阻塞** | 更完整 |
-| 头像不更新根因 | CDN purge 失败 | CDN purge 失败 **+ 缓存传播延迟** | 更完整 |
-| 噪音 | 0 | 0（压缩模式有效） | — |
-
-数字上的提升（29%）不如第一次测试（75%）夸张，但**这次更有说服力**——因为代码质量更高，bug 更隐蔽，发现的新问题更关键。
-
-核心差异在于两个模型的注意力分布：
-
-- **Claude** 的注意力在代码结构和逻辑正确性上（连接池配置、内存使用、事务边界、安全校验）
-- **Qwen** 的注意力在**运行时行为和系统交互**上（请求路径中的阻塞点、CDN 缓存传播的时间窗口）
-
-这正是多模型协作的价值场景：**不是找一个更强的模型替代当前模型，而是让不同注意力分布的模型互补。**
-
----
-
-## 为什么 Qwen 的输出没有干扰到 Claude
-
-多模型协作有一个真实风险——副驾驶的输出如果冗长散乱，会变成上下文垃圾，稀释主模型的推理质量。
-
-这次使用的 `-M review` 模式下，Qwen 的回复被约束在 5 条发现 + 一句话总结，总字数约 150 词。没有寒暄、没有免责声明、没有"希望这对你有帮助"。信噪比接近 100%。
-
-这是 [qwen-proxy](https://github.com/mengxinghun9657-boop/qwen-proxy) 项目内置的 6 种压缩预设之一：
-
-| 模式 | 场景 | 输出约束 |
-|------|------|----------|
-| `review` | 代码审查 | 按严重度三段式，200 词 |
-| `diagnose` | Bug 排查 | 根因+修复+备选，100 词 |
-| `concise` | 快速确认 | 结论先行，150 词 |
-| `judge` | 二元决策 | YES/NO + 置信度 + 原因 |
-| `keypoints` | 摘要 | 3-5 要点，无语境填充 |
-| `json` | 可解析输出 | 纯 JSON，无 markdown |
-
-压缩的本质是**在发送前就把问题说清楚想要什么样的回答**——不是后处理裁剪，而是预约束格式。
-
----
-
-## 协作流程
-
-```
-Claude Code                        Qwen (via proxy)
-     │                                   │
-     │  审查代码，发现 7 个问题            │
-     │  觉得 504 的解释不够透彻           │
-     │                                   │
-     ├── ask_qwen.py -M review ────────→ │
-     │   注入 SRE 系统提示词              │
-     │   注入输出格式约束                  │
-     │                                   │
-     │←── 5 条结构化发现 ────────────────┤
-     │   发现 CDN 同步阻塞 (#8)           │
-     │   发现缓存传播窗口 (#9)            │
-     │                                   │
-     ├── 合并：7 + 2 = 9 个问题          │
-     ├── 504 根因从 2 个升级到 3 个      │
-     └── 输出最终报告                     │
-```
-
----
-
-## 限制与坦诚
-
-1. **不是自动的** — Claude 根据预定义的决策准则自行判断何时调 Qwen。把 Qwen 当成一个可以咨询的同事，而不是一个自动触发的外挂
-2. **每次调用 ~10-30 秒延迟** — 简单问题不划算，内置规则定义了不受益于第二意见的场景
-3. **依赖 chat.qwen.ai 的 JWT token** — 需要从浏览器提取。对于会用 CLI / Git 的目标用户，这不算门槛
-4. **Qwen 回应的质量不总是稳定** — 有时会重复 Claude 已有的发现而不增加新值，这种情况就丢弃不引用
 
 ---
 
 ## 不只是 Qwen
 
-这套"主模型 + 压缩副驾驶"的模式不限于 Qwen。任何兼容 OpenAI API 的后端都可以接入——Ollama 本地模型、DeepSeek、Gemini。你可以根据任务类型路由到不同的副驾驶。
+这套"主模型 + 压缩副驾驶"的模式可以接入任何兼容 OpenAI API 的后端。你也可以用 Ollama 本地模型、DeepSeek、或者 Gemini。
 
-**多模型协作的挑战不是"找最强的模型"，而是"让它们互补而不互扰"。** 压缩输出只是其中一个解，欢迎讨论更好的方案。
+多模型协作的价值不在于"找一个比主模型更强的模型"，而在于当两个模型足够不同时，它们漏的东西不一样。
 
 ---
 

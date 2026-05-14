@@ -10,6 +10,7 @@ from session import SessionManager, TokenStatus
 from qwen_client import QwenClient, extract_content, extract_final_usage, extract_parent_id
 from deepseek_client import DeepSeekClient, load_token as load_ds_token
 from minimax_client import MinimaxClient, load_api_key as load_mm_key, MINIMAX_MODELS
+from middleware import MiddlewareEvent, MiddlewarePipeline
 
 app = FastAPI(title="unified-llm-gateway", version="2.0.0")
 session = SessionManager()
@@ -224,10 +225,8 @@ Continue the task. You are the SAME assistant as above. The tools results above 
             headers={"x-conversation-id": conv_id},
         )
 
-    # Non-streaming: accumulate
-    full_content = ""
-    tool_calls = []
-    final_msg_id = None
+    # Non-streaming: run through middleware pipeline
+    pipeline = MiddlewarePipeline(tools_requested=bool(tools))
     async for ev in ds.stream_completion(
         session_id=session_id,
         prompt=user_content,
@@ -235,20 +234,28 @@ Continue the task. You are the SAME assistant as above. The tools results above 
         thinking=True if "reasoner" in model or "r1" in model else False,
         tools=tools,
     ):
-        if ev["type"] == "content":
-            full_content += ev["text"]
-        elif ev["type"] == "tool_call":
-            tc_id = f"call_{uuid.uuid4().hex[:12]}"
-            tool_calls.append({
-                "id": tc_id,
-                "type": "function",
-                "function": {"name": ev["name"], "arguments": json.dumps(ev["arguments"], ensure_ascii=False)},
-            })
-        elif ev["type"] == "done":
+        pipeline.feed(MiddlewareEvent(
+            type=ev["type"],
+            text=ev.get("text", ""),
+            name=ev.get("name", ""),
+            arguments=ev.get("arguments", {}),
+            message_id=ev.get("message_id", ""),
+        ))
+        if ev["type"] == "done":
             if ev.get("message_id"):
                 parent_message_id = ev["message_id"]
                 _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
             _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
+
+    # Collect dispatched events and build response
+    full_content = ""
+    tool_calls = []
+    async for chunk in pipeline.dispatch():
+        delta = chunk.get("choices", [{}])[0].get("delta", {})
+        if "content" in delta and delta["content"]:
+            full_content += delta["content"]
+        if "tool_calls" in delta:
+            tool_calls.extend(delta["tool_calls"])
 
     if tool_calls:
         return JSONResponse({
@@ -271,7 +278,7 @@ Continue the task. You are the SAME assistant as above. The tools results above 
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": full_content},
+            "message": {"role": "assistant", "content": full_content or None},
             "finish_reason": "stop",
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},

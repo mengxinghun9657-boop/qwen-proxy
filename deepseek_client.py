@@ -328,8 +328,8 @@ def _try_extract_tool_call(text: str) -> dict | None:
     """
     import re
 
-    # Format 1: JSON tool call — find {"tool": "name", "args": by depth-matching braces
-    start_pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*\{'
+    # Format 1: JSON tool call — find {"tool": "name", "args" or "arguments": by depth-matching braces
+    start_pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"(?:args|arguments)"\s*:\s*\{'
     match = re.search(start_pattern, text)
     if match:
         name = match.group(1)

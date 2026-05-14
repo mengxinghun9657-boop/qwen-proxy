@@ -268,16 +268,17 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                 continue
 
             if event == "close":
-                # Flush remaining buffered content with validation
+                # Flush remaining buffered content, stripping any tool call JSON
                 if content_buf.strip():
                     tcs = _extract_tool_calls(content_buf)
                     if tcs:
                         for tc in tcs:
                             yield tc
                     else:
-                        # Validation: if tools were requested but response has no tool call,
-                        # try to salvage any actionable intent from the text
-                        yield {"type": "content", "text": content_buf}
+                        # Strip any raw tool JSON before yielding as clean content
+                        clean = _strip_tool_json(content_buf)
+                        if clean:
+                            yield {"type": "content", "text": clean}
                     content_buf = ""
                 yield {"type": "done", "message_id": response_msg_id, "finish_reason": "stop"}
                 return
@@ -308,8 +309,10 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                 # Try to extract tool calls
                 tc = _try_extract_tool_call(content_buf)
                 if tc:
-                    if tc["_before"].strip():
-                        yield {"type": "content", "text": tc["_before"]}
+                    # Only yield non-tool text before the tool call
+                    before = tc["_before"].strip()
+                    if before:
+                        yield {"type": "content", "text": before}
                     yield {"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]}
                     content_buf = tc["_after"]
                     continue
@@ -427,6 +430,18 @@ def _try_extract_tool_call(text: str) -> dict | None:
                 return {"_before": before, "name": "terminal", "arguments": {"command": cmd}, "_after": after}
 
     return None
+
+
+def _strip_tool_json(text: str) -> str:
+    """Remove raw {"tool": ...} JSON blocks from text, leaving only natural language."""
+    result = text
+    while True:
+        tc = _try_extract_tool_call(result)
+        if not tc:
+            break
+        # Remove the tool call JSON, keep surrounding text
+        result = (tc["_before"] + tc["_after"]).strip()
+    return result
 
 
 def _extract_tool_calls(text: str) -> list[dict]:

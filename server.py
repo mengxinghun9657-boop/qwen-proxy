@@ -114,6 +114,10 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
     if last_user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
 
+    # Cap transcript to last 20 messages to avoid context overflow
+    if len(transcript_parts) > 20:
+        transcript_parts = transcript_parts[-20:]
+
     # Build the final prompt
     if len(transcript_parts) <= 1:
         final_prompt = last_user_content
@@ -249,10 +253,13 @@ Continue the task. You are the SAME assistant as above. The tools results above 
                 _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
             _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
 
-    # Auto-retry: if model output pure analysis without tool calls, re-request
+    # Auto-retry: if model output pure analysis or empty response, re-request
     from middleware import Validator as MValidator
-    if MValidator.needs_retry(pipeline.collector, bool(tools)):
-        retry_prompt = user_content + MValidator.RETRY_PROMPT
+    needs_retry = MValidator.needs_retry(pipeline.collector, bool(tools))
+    is_empty = not pipeline.collector.has_tool_calls and not pipeline.collector.full_text.strip()
+    if needs_retry or is_empty:
+        reason = "empty response" if is_empty else "analysis without tool calls"
+        retry_prompt = user_content + f"\n\n## RETRY — Your previous response was REJECTED ({reason}).\nYou MUST output at least one {{\"tool\": ...}} call NOW. No text, no analysis, just the JSON tool call."
         pipeline2 = MiddlewarePipeline(tools_requested=bool(tools))
         async for ev in ds.stream_completion(
             session_id=session_id,

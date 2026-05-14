@@ -114,15 +114,18 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
     if last_user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
 
-    # Smart transcript management to prevent context overflow
-    MAX_ITEMS = 15
+    # Smart transcript management: summarize old turns to keep context but avoid overflow
+    MAX_ITEMS = 25
     if len(transcript_parts) > MAX_ITEMS:
-        first_user = transcript_parts[0] if transcript_parts[0].startswith("User:") else None
-        recent = transcript_parts[-(MAX_ITEMS - 2):]
-        if first_user:
-            transcript_parts = [first_user, "[... earlier turns summarized — continue from recent context below ...]"] + recent
-        else:
-            transcript_parts = ["[... earlier turns ...]"] + recent
+        # Build summary of completed work from tool results
+        completed_summary = []
+        for tp in transcript_parts[:-MAX_ITEMS]:
+            if tp.startswith("[tool returned:") and len(tp) > 20:
+                completed_summary.append(tp[16:80].strip() + "...")
+            elif tp.startswith("User:"):
+                completed_summary.append(tp[:80])
+        summary_text = "; ".join(completed_summary[-5:]) if completed_summary else "previous steps completed"
+        transcript_parts = [f"## TASK PROGRESS: {summary_text}"] + transcript_parts[-MAX_ITEMS:]
 
     # Build the final prompt
     if len(transcript_parts) <= 1:

@@ -420,7 +420,7 @@ async def chat_completions(request: Request):
     body = await request.json()
     model = body.get("model") or session.load_default_model()
     messages = body.get("messages", [])
-    stream = body.get("stream", True)
+    stream = body.get("stream", False)
     conv_id = request.headers.get("x-conversation-id")
 
     # --- route DeepSeek models ---

@@ -301,7 +301,15 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                         yield {"type": "content", "text": tc["_before"]}
                     yield {"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]}
                     content_buf = tc["_after"]
-                # Flush only if clearly not a tool call
+                    continue
+
+                # Safety: if buffer grows huge with no valid tool call, flush it
+                if len(content_buf) > 5000:
+                    yield {"type": "content", "text": content_buf}
+                    content_buf = ""
+                    continue
+
+                # Flush safe content
                 has_tool_marker = '"tool"' in content_buf
                 has_potential_tool = content_buf.strip().startswith('{"tool"') or '\n{"tool"' in content_buf
                 if len(content_buf) > 500 and not has_tool_marker and not has_potential_tool:
@@ -323,18 +331,17 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
 
 
 def _try_extract_tool_call(text: str) -> dict | None:
-    """Try to extract a tool call from text.
+    """Try to extract a tool call from text. Multiple fallback layers.
     Returns dict with _before, name, arguments, _after if found, else None.
     """
     import re
 
-    # Format 1: JSON tool call — find {"tool": "name", "args" or "arguments": by depth-matching braces
-    start_pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"(?:args|arguments)"\s*:\s*\{'
+    # ── Layer 1: JSON tool call {"tool": "name", "args"/"arguments"/"params"/"parameters": {...}} ──
+    start_pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"(?:args|arguments|params|parameters)"\s*:\s*\{'
     match = re.search(start_pattern, text)
     if match:
         name = match.group(1)
-        args_start = match.end() - 1  # position of the opening { of args
-        # Find matching closing brace tracking strings and brace depth
+        args_start = match.end() - 1
         depth = 0
         in_string = False
         escape_next = False
@@ -363,19 +370,27 @@ def _try_extract_tool_call(text: str) -> dict | None:
                     args_end = i + 1
                     break
         if args_end > 0:
-            # Now find the closing } of the tool call itself
             rest = text[args_end:].lstrip()
             if rest.startswith('}'):
                 args_json = text[args_start:args_end]
                 try:
                     args = json.loads(args_json)
                     before = text[:match.start()]
-                    after = text[args_end + 1:]  # skip the closing }
+                    after = text[args_end + 1:]
                     return {"_before": before, "name": name, "arguments": args, "_after": after}
                 except json.JSONDecodeError:
-                    pass
+                    # Try to salvage: replace single quotes, strip trailing commas
+                    try:
+                        fixed = re.sub(r',\s*}', '}', args_json)
+                        fixed = re.sub(r"'", '"', fixed)
+                        args = json.loads(fixed)
+                        before = text[:match.start()]
+                        after = text[args_end + 1:]
+                        return {"_before": before, "name": name, "arguments": args, "_after": after}
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
-    # Format 2: bash code block — extract first command as terminal call
+    # ── Layer 2: bash code block → terminal call ──
     bash_pattern = r'```bash\s*\n(.*?)\n```'
     match = re.search(bash_pattern, text, re.DOTALL)
     if match:
@@ -384,6 +399,21 @@ def _try_extract_tool_call(text: str) -> dict | None:
             before = text[:match.start()]
             after = text[match.end():]
             return {"_before": before, "name": "terminal", "arguments": {"command": command}, "_after": after}
+
+    # ── Layer 3: natural language command patterns → terminal call ──
+    # "Let me check: `docker ps`" or "I'll run: docker ps"
+    cmd_patterns = [
+        r'(?:run|execute|check|try)[:\s]+`([^`]+)`',
+        r'`(docker|nvidia|pip|python|git|curl|cd|ls|cat|mkdir|find|grep)\s[^`]+`',
+    ]
+    for pat in cmd_patterns:
+        match = re.search(pat, text, re.IGNORECASE)
+        if match:
+            cmd = match.group(1) if match.lastindex else match.group(0).strip('`')
+            if cmd and len(cmd) > 3:
+                before = text[:match.start()]
+                after = text[match.end():]
+                return {"_before": before, "name": "terminal", "arguments": {"command": cmd}, "_after": after}
 
     return None
 

@@ -113,13 +113,19 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
 
     # Build the final prompt
     if len(transcript_parts) <= 1:
-        # Single turn: just the user message
         final_prompt = last_user_content
         if system:
             final_prompt = f"[System: {system}]\n\n{final_prompt}"
     else:
-        # Multi-turn: include full transcript
-        final_prompt = "\n\n".join(transcript_parts)
+        # Multi-turn: include full transcript with clear continuation marker
+        history = "\n".join(transcript_parts)
+        final_prompt = f"""## CONVERSATION HISTORY (same session — continue from here)
+
+{history}
+
+## CURRENT TURN
+
+Continue the task. You are the SAME assistant as above. The tools results above are REAL — do NOT re-run completed steps. Pick up where you left off. If the last step was successful, move to the next. If it failed, fix it."""
         if system:
             final_prompt = f"[System: {system}]\n\n{final_prompt}"
 

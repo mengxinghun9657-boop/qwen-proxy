@@ -143,30 +143,22 @@ class DeepSeekClient:
 
 ## REQUIRED OUTPUT FORMAT
 
-Every response MUST be one of:
+Tool call → {{"tool": "<name>", "arguments": {{"param": "value"}}}}
+Reply     → Your text to the user (only AFTER all tool results confirm success)
 
-  Tool call → {{"tool": "<name>", "arguments": {{"param": "value"}}}}
-  Reply     → Your text to the user (only when all tools are done)
+## CRITICAL RULES — VIOLATIONS CAUSE TASK FAILURE
 
-## FORMAT RULES
+1. FIRST response to any task MUST be a tool call. NEVER start with analysis.
+2. NEVER output "已完成"/"已通过"/"completed"/"done" unless a tool result CONFIRMS it.
+3. NEVER describe what you will do — just call the tool.
+4. NEVER output both analysis AND a tool call — pick the tool call.
+5. After a tool result, IMMEDIATELY call the next tool. No commentary between.
+6. If a tool fails, call another tool to fix it. Never give up.
+7. Use "arguments" key. Valid JSON. No code blocks.
 
-1. Tool calls use "arguments" as the key name (NOT "args", NOT "params").
-2. One tool call per line. Multiple calls = multiple lines.
-3. NO markdown code blocks. NO ```json wrapping. Just the raw JSON.
-4. NO descriptive text before a tool call. Just output the JSON.
-5. After a tool result, IMMEDIATELY output the next tool call or reply.
-6. Valid JSON only: double-quotes, no trailing commas, no single quotes.
+## CURRENT TASK
 
-## EXAMPLES
-
-✓ Correct:
-{{"tool": "terminal", "arguments": {{"command": "docker --version"}}}}
-{{"tool": "terminal", "arguments": {{"command": "nvidia-smi"}}}}
-
-✗ Wrong:
-- ```json {{"tool": "terminal", ...}} ```  (no code blocks)
-- {{"tool": "terminal", "args": {{...}}}}   (use "arguments" not "args")
-- Let me check that for you...              (no descriptions, just call it)"""
+You are in the MIDDLE of a multi-step task. Look at the conversation above to see what has been done and what remains. Continue from where you left off. Do NOT restart or re-analyze completed steps. Do NOT claim completion unless ALL steps are verified by tool results."""
 
     async def stream_completion(
         self,
@@ -192,7 +184,7 @@ Every response MUST be one of:
             "parent_message_id": parent_message_id,
             "prompt": final_prompt,
             "ref_file_ids": [],
-            "thinking_enabled": False if tools else thinking,
+            "thinking_enabled": False,  # disabled globally for speed; Hermes tasks need action not deep thought
             "search_enabled": search,
         }
 

@@ -123,7 +123,39 @@ class ToolCallParser:
                 except json.JSONDecodeError:
                     pass
 
-        # Strategy 2: ```bash ... ``` → terminal
+        # Strategy 2: tool_name({"arg": "value"}) — model outputs function-call style
+        m = re.search(r'\b(terminal|write_file|read_file|search_files|browser_navigate|'
+                       r'process|todo|memory)\s*\(\s*\{', text)
+        if m:
+            name = m.group(1)
+            start = m.end() - 1  # position of {
+            # same depth tracking as strategy 1
+            depth, in_str, esc = 0, False, False
+            end = -1
+            for i in range(start, len(text)):
+                c = text[i]
+                if esc: esc = False; continue
+                if c == '\\': esc = True; continue
+                if c == '"' and not in_str: in_str = True; continue
+                if c == '"' and in_str: in_str = False; continue
+                if in_str: continue
+                if c == '{': depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0: end = i + 1; break
+            if end > 0:
+                try:
+                    args = json.loads(text[start:end])
+                    return {
+                        "_before": text[:m.start()],
+                        "name": name,
+                        "arguments": args,
+                        "_after": text[end:],
+                    }
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 3: ```bash ... ``` → terminal
         m = re.search(r'```bash\s*\n(.*?)\n```', text, re.DOTALL)
         if m:
             cmd = m.group(1).strip()

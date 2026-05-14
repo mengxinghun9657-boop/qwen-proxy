@@ -396,7 +396,36 @@ def _try_extract_tool_call(text: str) -> dict | None:
                     except (json.JSONDecodeError, ValueError):
                         pass
 
-    # ── Layer 2: bash code block → terminal call ──
+    # ── Layer 2: tool_name({"arg": "value"}) function-call format ──
+    fn_pattern = r'\b(terminal|write_file|read_file|search_files|process|todo|memory|'
+    fn_pattern += r'browser_navigate|browser_click|browser_snapshot|browser_type|'
+    fn_pattern += r'skill_view|skills_list|delegate_task|cronjob)\s*\(\s*\{'
+    m = re.search(fn_pattern, text)
+    if m:
+        name = m.group(1)
+        start = m.end() - 1
+        depth, in_str, esc = 0, False, False
+        end = -1
+        for i in range(start, len(text)):
+            c = text[i]
+            if esc: esc = False; continue
+            if c == '\\': esc = True; continue
+            if c == '"' and not in_str: in_str = True; continue
+            if c == '"' and in_str: in_str = False; continue
+            if in_str: continue
+            if c == '{': depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0: end = i + 1; break
+        if end > 0:
+            try:
+                args = json.loads(text[start:end])
+                return {"_before": text[:m.start()], "name": name,
+                        "arguments": args, "_after": text[end:]}
+            except json.JSONDecodeError:
+                pass
+
+    # ── Layer 3: bash code block → terminal call ──
     bash_pattern = r'```bash\s*\n(.*?)\n```'
     match = re.search(bash_pattern, text, re.DOTALL)
     if match:
@@ -406,7 +435,7 @@ def _try_extract_tool_call(text: str) -> dict | None:
             after = text[match.end():]
             return {"_before": before, "name": "terminal", "arguments": {"command": command}, "_after": after}
 
-    # ── Layer 3: natural language command patterns → terminal call ──
+    # ── Layer 4: natural language command patterns → terminal call ──
     # "Let me check: `docker ps`" or "I'll run: docker ps"
     cmd_patterns = [
         r'(?:run|execute|check|try)[:\s]+`([^`]+)`',

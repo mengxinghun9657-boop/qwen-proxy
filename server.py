@@ -247,6 +247,32 @@ Continue the task. You are the SAME assistant as above. The tools results above 
                 _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
             _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
 
+    # Auto-retry: if model output pure analysis without tool calls, re-request
+    from middleware import Validator as MValidator
+    if MValidator.needs_retry(pipeline.collector, bool(tools)):
+        retry_prompt = user_content + MValidator.RETRY_PROMPT
+        pipeline2 = MiddlewarePipeline(tools_requested=bool(tools))
+        async for ev in ds.stream_completion(
+            session_id=session_id,
+            prompt=retry_prompt,
+            parent_message_id=parent_message_id,
+            thinking=False,
+            tools=tools,
+        ):
+            pipeline2.feed(MiddlewareEvent(
+                type=ev["type"],
+                text=ev.get("text", ""),
+                name=ev.get("name", ""),
+                arguments=ev.get("arguments", {}),
+                message_id=ev.get("message_id", ""),
+            ))
+            if ev["type"] == "done":
+                if ev.get("message_id"):
+                    parent_message_id = ev["message_id"]
+                    _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
+                _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
+        pipeline = pipeline2  # use retry result
+
     # Collect dispatched events and build response
     full_content = ""
     tool_calls = []

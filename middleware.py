@@ -171,6 +171,26 @@ class ContentCleaner:
 class Validator:
     """Ensure tool calls exist when tools were requested."""
 
+    # Retry correction appended when model outputs analysis instead of tools
+    RETRY_PROMPT = (
+        "\n\n## REJECTED — Your previous response was analysis-only with no tool calls."
+        "\nYou MUST now output at least one {\"tool\": \"...\", \"arguments\": {...}} call."
+        "\nDo NOT describe, plan, or analyze. Execute a tool immediately."
+    )
+
+    @staticmethod
+    def needs_retry(collector: EventCollector, tools_requested: bool) -> bool:
+        """Check if response should be retried (analysis-only, no salvageable commands)."""
+        if not tools_requested:
+            return False
+        if collector.has_tool_calls:
+            return False
+        text = collector.full_text.strip()
+        if not text:
+            return True
+        tcs = ToolCallParser.extract(text)
+        return len(tcs) == 0  # pure analysis, nothing to salvage
+
     @staticmethod
     def validate(
         collector: EventCollector,
@@ -181,18 +201,17 @@ class Validator:
         Returns replacement events or None if response is valid.
         """
         if not tools_requested:
-            return None  # no tools expected, response is fine
+            return None
         if collector.has_tool_calls:
-            return None  # has tool calls, all good
+            return None
 
-        # Try to extract tool calls from text
         text = collector.full_text
         if not text.strip():
-            return None  # empty response
+            return None
 
         tcs = ToolCallParser.extract(text)
         if not tcs:
-            return None  # no actionable commands found
+            return None  # pure analysis — handled by retry
 
         # Found tool calls in text — rebuild response
         clean_text = ContentCleaner.clean(text)
@@ -205,6 +224,7 @@ class Validator:
                 name=tc["name"],
                 arguments=tc["arguments"],
             ))
+        log.info("middleware: salvaged %d tool calls from response text", len(tcs))
         return new_events
 
 

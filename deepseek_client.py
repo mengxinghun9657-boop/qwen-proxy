@@ -504,7 +504,18 @@ def _try_extract_tool_call(text: str) -> dict | None:
             after = text[match.end():]
             return {"_before": before, "name": "terminal", "arguments": {"command": command}, "_after": after}
 
-    # ── Layer 7: natural language commands → terminal call ──
+    # ── Layer 7: "Tool called: `name` with arguments: `{...}`" format ──
+    desc_pattern = r'Tool\s+(?:called|call)[:\s]+`(\w+)`\s+(?:with\s+)?(?:arguments?|args?)[:\s]+`(\{[^`]+\})`'
+    m = re.search(desc_pattern, text, re.IGNORECASE)
+    if m:
+        try:
+            args = json.loads(m.group(2))
+            return {"_before": text[:m.start()], "name": m.group(1),
+                    "arguments": args, "_after": text[m.end():]}
+        except json.JSONDecodeError:
+            pass
+
+    # ── Layer 8: natural language commands → terminal call ──
     # "Let me check: `docker ps`" or "I'll run: docker ps"
     cmd_patterns = [
         r'(?:run|execute|check|try)[:\s]+`([^`]+)`',

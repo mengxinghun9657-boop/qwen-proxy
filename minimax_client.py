@@ -97,6 +97,7 @@ class MinimaxClient:
         thinking: bool = True,
         thinking_budget: int = 4096,
         stream: bool = True,
+        tools: list[dict] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Call MiniMax Anthropic-compatible API and yield canonical events.
 
@@ -119,6 +120,12 @@ class MinimaxClient:
                 system = m["content"]
             elif m["role"] in ("user", "assistant"):
                 anthropic_messages.append({"role": m["role"], "content": m["content"]})
+            elif m["role"] == "tool":
+                # Anthropic format: tool results go in a special content block
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": m.get("tool_call_id", ""), "content": m.get("content", "")}]
+                })
 
         body: dict = {
             "model": model,
@@ -128,8 +135,20 @@ class MinimaxClient:
         }
         if system:
             body["system"] = system
-        if thinking:
+        if thinking and not tools:
             body["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+
+        # Convert OpenAI tools → Anthropic tools format
+        if tools:
+            anthropic_tools = []
+            for t in tools:
+                fn = t.get("function", {})
+                anthropic_tools.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}, "required": []}),
+                })
+            body["tools"] = anthropic_tools
 
         try:
             if stream:
@@ -219,22 +238,14 @@ def _translate_sse_event(event_type: str | None, data: dict) -> dict[str, Any] |
 
     elif typ == "content_block_start":
         block = data.get("content_block", {})
-        return {
-            "type": "block_start",
-            "index": data.get("index"),
-            "block_type": block.get("type"),
-        }
-
-    elif typ == "content_block_delta":
-        delta = data.get("delta", {})
-        delta_type = delta.get("type")
-        if delta_type == "thinking_delta":
-            return {"type": "thinking", "text": delta.get("thinking", "")}
-        elif delta_type == "text_delta":
-            return {"type": "content", "text": delta.get("text", "")}
-        elif delta_type == "signature_delta":
-            return {"type": "signature", "text": delta.get("signature", "")}
-        return None
+        if block.get("type") == "tool_use":
+            return {
+                "type": "tool_call_start",
+                "index": data.get("index"),
+                "name": block.get("name", ""),
+                "tool_id": block.get("id", ""),
+            }
+        return {"type": "block_start", "index": data.get("index"), "block_type": block.get("type")}
 
     elif typ == "content_block_stop":
         return None

@@ -95,11 +95,10 @@ class QwenClient:
         self, chat_id: str, parent_id: str | None, content: str,
         model: str, system: str | None = None,
         stream: bool = True,
+        tools: list[dict] | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Send a message and yield SSE chunks.
         Set parent_id=None for the first message in a chat.
-        The first yielded chunk will be {'_type': 'response.created', 'parent_id': '...'}
-        when parent_id=None, so the caller can track the new parent_id.
         """
         user_fid = _uuid()
         assistant_fid = _uuid()
@@ -138,6 +137,8 @@ class QwenClient:
 
         if system:
             payload["system_message"] = system
+        if tools:
+            payload["tools"] = tools
 
         async with _http_client(timeout=300) as client:
             async with client.stream(

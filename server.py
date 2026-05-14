@@ -321,6 +321,7 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
     """
     messages = body.get("messages", [])
     model = body.get("model", "MiniMax-M2.7")
+    tools = body.get("tools")
 
     if not load_mm_key():
         raise HTTPException(401, detail={"error": {"message": "No MiniMax API key configured", "type": "auth_error"}})
@@ -356,16 +357,47 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
     async def sse_stream() -> AsyncGenerator[str, None]:
         full_content = ""
         estimated_tokens = 0
+        pending_tool_call: dict | None = None  # accumulate tool_use across events
         async for ev in mm.stream_completion(
             messages=history_messages,
             model=model,
             max_tokens=body.get("max_tokens", 4096),
-            thinking=body.get("thinking", True) if isinstance(body.get("thinking"), bool) else True,
-            thinking_budget=body.get("thinking_budget", 4096) if isinstance(body.get("thinking_budget"), int) else 4096,
+            thinking=False,  # disable thinking for tool mode
+            thinking_budget=0,
             stream=True,
+            tools=tools,
         ):
             if ev["type"] == "content":
                 full_content += ev["text"]
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif ev["type"] == "tool_call_start":
+                pending_tool_call = {
+                    "id": ev.get("tool_id", f"call_{uuid.uuid4().hex[:12]}"),
+                    "type": "function",
+                    "function": {"name": ev.get("name", ""), "arguments": ""},
+                }
+            elif ev["type"] == "tool_input" and pending_tool_call:
+                pending_tool_call["function"]["arguments"] += ev["text"]
+            elif ev["type"] == "content_block_stop" and pending_tool_call:
+                # Flush accumulated tool call
+                tc = pending_tool_call
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"tool_calls": [tc]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                pending_tool_call = None
+            elif ev["type"] == "thinking":
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -425,32 +457,51 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
             headers={"x-conversation-id": new_conv_id},
         )
 
-    # Non-streaming: accumulate
+    # Non-streaming: accumulate with tool support
     full_content = ""
-    full_reasoning = ""
+    tool_calls = []
     usage = {}
+    pending_tc: dict | None = None
     async for ev in mm.stream_completion(
         messages=history_messages,
         model=model,
         max_tokens=body.get("max_tokens", 4096),
-        thinking=body.get("thinking", True) if isinstance(body.get("thinking"), bool) else True,
-        thinking_budget=body.get("thinking_budget", 4096) if isinstance(body.get("thinking_budget"), int) else 4096,
+        thinking=False,
+        thinking_budget=0,
         stream=True,
+        tools=tools,
     ):
         if ev["type"] == "content":
             full_content += ev["text"]
-        elif ev["type"] == "thinking":
-            full_reasoning += ev["text"]
+        elif ev["type"] == "tool_call_start":
+            pending_tc = {
+                "id": ev.get("tool_id", f"call_{uuid.uuid4().hex[:12]}"),
+                "type": "function",
+                "function": {"name": ev.get("name", ""), "arguments": ""},
+            }
+        elif ev["type"] == "tool_input" and pending_tc:
+            pending_tc["function"]["arguments"] += ev["text"]
+        elif ev["type"] == "content_block_stop" and pending_tc:
+            tool_calls.append(pending_tc)
+            pending_tc = None
         elif ev["type"] == "done":
             usage = ev.get("usage", {})
         elif ev["type"] == "error":
             raise HTTPException(502, detail={"error": {"message": ev["message"], "type": "upstream_error"}})
 
-    # Store response for conversation continuity
-    if full_content and new_conv_id in _mm_conversations:
-        msgs = _mm_conversations[new_conv_id].get("messages", [])
-        msgs.append({"role": "assistant", "content": full_content})
-        _mm_conversations[new_conv_id]["last_access"] = time.time()
+    if tool_calls:
+        return JSONResponse({
+            "id": response_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }, headers={"x-conversation-id": new_conv_id})
 
     resp: dict = {
         "id": response_id,
@@ -459,12 +510,10 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": full_content},
+            "message": {"role": "assistant", "content": full_content or None},
             "finish_reason": "stop",
         }],
     }
-    if full_reasoning:
-        resp["choices"][0]["message"]["reasoning_content"] = full_reasoning
     if usage:
         resp["usage"] = {
             "prompt_tokens": usage.get("input_tokens", 0),
@@ -479,6 +528,8 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/chat/completions")
+
+
 async def chat_completions(request: Request):
     body = await request.json()
     model = body.get("model") or session.load_default_model()
@@ -504,8 +555,9 @@ async def chat_completions(request: Request):
     token = session.load_token()
     client = QwenClient(token)
 
-    # --- extract system message ---
+    # --- extract system message + tools ---
     system = None
+    tools = body.get("tools")
     non_system = []
     for m in messages:
         if m["role"] == "system":
@@ -632,6 +684,16 @@ async def chat_completions(request: Request):
         "usage": usage,
     }, headers={"x-conversation-id": conv_id})
 
+
+def _extract_qwen_tool_calls(chunk: dict) -> list[dict] | None:
+    """Extract tool_calls from Qwen API response chunk. Returns OpenAI-format list or None."""
+    choices = chunk.get("choices", [])
+    for c in choices:
+        delta = c.get("delta", {})
+        tc = delta.get("tool_calls")
+        if tc:
+            return tc
+    return None
 
 @app.get("/v1/models")
 async def list_models():

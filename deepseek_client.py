@@ -251,8 +251,12 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
             if event == "close":
                 # Flush remaining buffered content
                 if content_buf.strip():
-                    for tc in _extract_tool_calls(content_buf):
-                        yield tc
+                    tcs = _extract_tool_calls(content_buf)
+                    if tcs:
+                        for tc in tcs:
+                            yield tc
+                    else:
+                        yield {"type": "content", "text": content_buf}
                     content_buf = ""
                 yield {"type": "done", "message_id": response_msg_id, "finish_reason": "stop"}
                 return

@@ -175,7 +175,8 @@ Example: {{"tool": "terminal", "args": {{"command": "docker --version"}}}}
         final_prompt = prompt
         if tools:
             tool_instructions = self._format_tools_prompt(tools)
-            final_prompt = f"[System: {tool_instructions}]\n\n{prompt}"
+            # Inject tools as a critical system directive at the very beginning
+            final_prompt = f"CRITICAL: {tool_instructions}\n\n---\n\n{prompt}"
 
         body = {
             "chat_session_id": session_id,
@@ -321,22 +322,48 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
 
 
 def _try_extract_tool_call(text: str) -> dict | None:
-    """Try to extract a {"tool": ..., "args": {...}} call from text.
-    Returns dict with _before, name, arguments, _after if found, else None."""
+    """Try to extract a tool call from text. Supports two formats:
+    1. {"tool": "name", "args": {...}} JSON format
+    2. ```bash ... ``` markdown code block (converted to terminal tool call)
+    Returns dict with _before, name, arguments, _after if found, else None.
+    """
     import re
-    # Look for {"tool": "name", "args": {...}} on its own line
+
+    # Format 1: JSON tool call
     pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[^}]+\})\s*\}'
     match = re.search(pattern, text)
-    if not match:
-        return None
-    try:
-        name = match.group(1)
-        args = json.loads(match.group(2))
-        before = text[:match.start()]
-        after = text[match.end():]
-        return {"_before": before, "name": name, "arguments": args, "_after": after}
-    except (json.JSONDecodeError, KeyError):
-        return None
+    if match:
+        try:
+            name = match.group(1)
+            args = json.loads(match.group(2))
+            before = text[:match.start()]
+            after = text[match.end():]
+            return {"_before": before, "name": name, "arguments": args, "_after": after}
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Format 2: bash code block — extract first command as terminal call
+    bash_pattern = r'```bash\s*\n(.*?)\n```'
+    match = re.search(bash_pattern, text, re.DOTALL)
+    if match:
+        command = match.group(1).strip()
+        if command:
+            before = text[:match.start()]
+            after = text[match.end():]
+            return {"_before": before, "name": "terminal", "arguments": {"command": command}, "_after": after}
+
+    # Format 3: inline `command` — extract single backtick command
+    cmd_pattern = r'`([^`]+)`'
+    match = re.search(cmd_pattern, text)
+    if match:
+        cmd = match.group(1).strip()
+        # Only if it looks like a real command (not inline code)
+        if any(cmd.startswith(p) for p in ('docker', 'nvidia', 'curl', 'pip', 'python', 'ls ', 'cat ', 'mkdir', 'cd ', 'git ')):
+            before = text[:match.start()]
+            after = text[match.end():]
+            return {"_before": before, "name": "terminal", "arguments": {"command": cmd}, "_after": after}
+
+    return None
 
 
 def _extract_tool_calls(text: str) -> list[dict]:

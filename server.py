@@ -173,6 +173,7 @@ Continue the task. You are the SAME assistant as above. The tools results above 
     async def sse_stream() -> AsyncGenerator[str, None]:
         nonlocal parent_message_id
         estimated_tokens = 0
+        tool_calls_count = 0
         async for ev in ds.stream_completion(
             session_id=session_id,
             prompt=user_content,
@@ -193,6 +194,7 @@ Continue the task. You are the SAME assistant as above. The tools results above 
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif ev["type"] == "tool_call":
+                tool_calls_count += 1
                 estimated_tokens += max(1, len(ev.get("name", "")) // 4 + len(str(ev.get("arguments", {}))) // 8)
                 tc_id = f"call_{uuid.uuid4().hex[:12]}"
                 chunk = {
@@ -219,14 +221,27 @@ Continue the task. You are the SAME assistant as above. The tools results above 
             "created": created,
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": estimated_tokens, "total_tokens": estimated_tokens},
+            "usage": {"prompt_tokens": 0, "completion_tokens": estimated_tokens or 1, "total_tokens": estimated_tokens or 1},
         }
         yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     if stream:
+        # Wrap streaming to prevent empty responses reaching Hermes
+        async def guarded_stream() -> AsyncGenerator[str, None]:
+            has_output = False
+            async for chunk in sse_stream():
+                has_output = True
+                yield chunk
+            if not has_output:
+                # Stream produced nothing — emit minimal fallback
+                fb = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": "."}, "finish_reason": None}]}
+                yield f"data: {json.dumps(fb, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({**fb, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
         return StreamingResponse(
-            sse_stream(),
+            guarded_stream(),
             media_type="text/event-stream",
             headers={"x-conversation-id": conv_id},
         )

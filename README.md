@@ -1,32 +1,41 @@
-# Qwen Proxy
+# Unified LLM Gateway
 
-OpenAI 兼容的反向代理，将 [chat.qwen.ai](https://chat.qwen.ai) 的内部 API 转译为标准 `/v1/chat/completions` 接口，附带 CLI 工具用于 AI 协作。
+三模型统一网关：DeepSeek + Qwen + MiniMax，OpenAI 兼容 API (localhost:8800)，支持 Hermes Agent 工具调用。
 
-*An OpenAI-compatible reverse proxy that translates [chat.qwen.ai](https://chat.qwen.ai)'s internal API into standard `/v1/chat/completions` endpoints, with a CLI tool for AI-assisted collaboration.*
+*Multi-model unified gateway: DeepSeek + Qwen + MiniMax, OpenAI-compatible API with tool calling support for Hermes Agent.*
 
 ---
 
 ## 目录 / Table of Contents
 
-- [工作机制 / How It Works](#工作机制--how-it-works)
-- [实现原理 / Implementation](#实现原理--implementation)
 - [快速开始 / Quick Start](#快速开始--quick-start)
 - [API 参考 / API Reference](#api-参考--api-reference)
+- [DeepSeek Tool Calling](#deepseek-tool-calling)
 - [CLI 协作工具 / CLI Collaboration Tool](#cli-协作工具--cli-collaboration-tool)
 - [部署 / Deployment](#部署--deployment)
-- [安全 / Security](#安全--security)
 
 ---
 
-## 工作机制 / How It Works
+## 快速开始 / Quick Start
 
-### 问题背景 / The Problem
+```bash
+cd /opt/llm/qwen-proxy
+sudo systemctl restart qwen-proxy
 
-Qwen 的 Web 应用 ([chat.qwen.ai](https://chat.qwen.ai)) 使用自己的一套内部 API（`/api/v2/chat/completions`），与 OpenAI 的 `/v1/chat/completions` 格式不兼容。这意味着无法用标准 OpenAI SDK、LangChain、或 Claude Code 等工具直接调用。
+# 测试
+curl http://localhost:8800/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
 
-*Qwen's web app uses its own internal API format (`/api/v2/chat/completions`), incompatible with the standard OpenAI `/v1/chat/completions`. This means any tool built for the OpenAI protocol — SDKs, LangChain, Claude Code — cannot call Qwen directly.*
+# 管理面板
+open http://localhost:8800/admin
+```
 
-### 解决方案 / The Solution
+### 工作机制
+
+网关按 `model` 前缀路由到三个后端，统一输出 OpenAI 兼容格式。Hermes Agent 通过 `custom` provider 接入。
+
+*The gateway routes by model prefix to three backends, outputting OpenAI-compatible format. Hermes Agent connects via `custom` provider.*
 
 ```
                         OpenAI 协议                    Qwen 内部协议

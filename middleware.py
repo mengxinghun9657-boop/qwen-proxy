@@ -155,7 +155,84 @@ class ToolCallParser:
                 except json.JSONDecodeError:
                     pass
 
-        # Strategy 3: ```bash ... ``` → terminal
+        # Strategy 3: OpenAI bare format {"name": "terminal", "arguments": {...}}
+        # (no outer {"tool": ...} wrapper — common in OpenAI training data)
+        m = re.search(
+            r'\{\s*"name"\s*:\s*"(terminal|write_file|read_file|search_files|process|'
+            r'todo|memory|browser_navigate|delegate_task|cronjob|skill_view)"\s*,\s*'
+            r'"(?:arguments|args|params)"\s*:\s*\{',
+            text
+        )
+        if m:
+            name = m.group(1)
+            start = m.end() - 1
+            depth, in_str, esc = 0, False, False
+            end = -1
+            for i in range(start, len(text)):
+                c = text[i]
+                if esc: esc = False; continue
+                if c == '\\': esc = True; continue
+                if c == '"' and not in_str: in_str = True; continue
+                if c == '"' and in_str: in_str = False; continue
+                if in_str: continue
+                if c == '{': depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0: end = i + 1; break
+            if end > 0:
+                try:
+                    args = json.loads(text[start:end])
+                    return {"_before": text[:m.start()], "name": name,
+                            "arguments": args, "_after": text[end:]}
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 4: Anthropic format {"type": "tool_use", "name": "...", "input": {...}}
+        m = re.search(
+            r'\{\s*"type"\s*:\s*"tool_use"\s*,\s*"name"\s*:\s*"([^"]+)"\s*,\s*"input"\s*:\s*\{',
+            text
+        )
+        if m:
+            name = m.group(1)
+            start = m.end() - 1
+            depth, in_str, esc = 0, False, False
+            end = -1
+            for i in range(start, len(text)):
+                c = text[i]
+                if esc: esc = False; continue
+                if c == '\\': esc = True; continue
+                if c == '"' and not in_str: in_str = True; continue
+                if c == '"' and in_str: in_str = False; continue
+                if in_str: continue
+                if c == '{': depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0: end = i + 1; break
+            if end > 0:
+                try:
+                    args = json.loads(text[start:end])
+                    return {"_before": text[:m.start()], "name": name,
+                            "arguments": args, "_after": text[end:]}
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 5: ReAct/Agent format "Action: tool_name\nAction Input: {...}"
+        m = re.search(
+            r'Action\s*:\s*(terminal|write_file|read_file|search_files|process|'
+            r'todo|memory|browser_navigate|delegate_task|cronjob|skill_view)\s*\n\s*'
+            r'Action\s*Input\s*:\s*(\{[^}]+\})',
+            text, re.IGNORECASE
+        )
+        if m:
+            name = m.group(1)
+            try:
+                args = json.loads(m.group(2))
+                return {"_before": text[:m.start()], "name": name,
+                        "arguments": args, "_after": text[m.end():]}
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 6: ```bash ... ``` → terminal
         m = re.search(r'```bash\s*\n(.*?)\n```', text, re.DOTALL)
         if m:
             cmd = m.group(1).strip()
@@ -167,7 +244,7 @@ class ToolCallParser:
                     "_after": text[m.end():],
                 }
 
-        # Strategy 3: inline `command` → terminal
+        # Strategy 7: inline `command` → terminal
         for prefix in ('docker', 'nvidia', 'pip', 'python', 'git', 'curl',
                         'ls ', 'cat ', 'mkdir', 'cd ', 'find', 'grep'):
             m = re.search(rf'`({prefix}[^`]+)`', text)

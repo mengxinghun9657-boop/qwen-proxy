@@ -425,7 +425,76 @@ def _try_extract_tool_call(text: str) -> dict | None:
             except json.JSONDecodeError:
                 pass
 
-    # ── Layer 3: bash code block → terminal call ──
+    # ── Layer 3: OpenAI bare format {"name":"terminal","arguments":{...}} ──
+    fn_names = r'(?:terminal|write_file|read_file|search_files|process|todo|memory|browser_navigate|delegate_task|cronjob|skill_view)'
+    m = re.search(r'\{\s*"name"\s*:\s*"' + fn_names + r'"\s*,\s*"(?:arguments|args|params)"\s*:\s*\{', text)
+    if m:
+        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', m.group())
+        name = name_match.group(1) if name_match else "terminal"
+        start = m.end() - 1
+        depth, in_str, esc = 0, False, False
+        end = -1
+        for i in range(start, len(text)):
+            c = text[i]
+            if esc: esc = False; continue
+            if c == '\\': esc = True; continue
+            if c == '"' and not in_str: in_str = True; continue
+            if c == '"' and in_str: in_str = False; continue
+            if in_str: continue
+            if c == '{': depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0: end = i + 1; break
+        if end > 0:
+            try:
+                args = json.loads(text[start:end])
+                return {"_before": text[:m.start()], "name": name,
+                        "arguments": args, "_after": text[end:]}
+            except json.JSONDecodeError:
+                pass
+
+    # ── Layer 4: Anthropic format {"type":"tool_use",...} ── {"type": "tool_use", "name": "...", "input": {...}} ──
+    m = re.search(r'\{\s*"type"\s*:\s*"tool_use"\s*,\s*"name"\s*:\s*"([^"]+)"\s*,\s*"input"\s*:\s*\{', text)
+    if m:
+        name = m.group(1)
+        start = m.end() - 1
+        depth, in_str, esc = 0, False, False
+        end = -1
+        for i in range(start, len(text)):
+            c = text[i]
+            if esc: esc = False; continue
+            if c == '\\': esc = True; continue
+            if c == '"' and not in_str: in_str = True; continue
+            if c == '"' and in_str: in_str = False; continue
+            if in_str: continue
+            if c == '{': depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0: end = i + 1; break
+        if end > 0:
+            try:
+                args = json.loads(text[start:end])
+                return {"_before": text[:m.start()], "name": name,
+                        "arguments": args, "_after": text[end:]}
+            except json.JSONDecodeError:
+                pass
+
+    # ── Layer 5: ReAct format "Action:..." ── "Action: X\nAction Input: {...}" ──
+    m = re.search(
+        r'Action\s*:\s*(terminal|write_file|read_file|search_files|process|'
+        r'todo|memory|browser_navigate)\s*\n\s*'
+        r'Action\s*Input\s*:\s*(\{[^}]+\})',
+        text, re.IGNORECASE
+    )
+    if m:
+        try:
+            args = json.loads(m.group(2))
+            return {"_before": text[:m.start()], "name": m.group(1),
+                    "arguments": args, "_after": text[m.end():]}
+        except json.JSONDecodeError:
+            pass
+
+    # ── Layer 6: bash code block → terminal call ──
     bash_pattern = r'```bash\s*\n(.*?)\n```'
     match = re.search(bash_pattern, text, re.DOTALL)
     if match:
@@ -435,7 +504,7 @@ def _try_extract_tool_call(text: str) -> dict | None:
             after = text[match.end():]
             return {"_before": before, "name": "terminal", "arguments": {"command": command}, "_after": after}
 
-    # ── Layer 4: natural language command patterns → terminal call ──
+    # ── Layer 7: natural language commands → terminal call ──
     # "Let me check: `docker ps`" or "I'll run: docker ps"
     cmd_patterns = [
         r'(?:run|execute|check|try)[:\s]+`([^`]+)`',

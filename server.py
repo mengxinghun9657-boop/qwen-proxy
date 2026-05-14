@@ -102,7 +102,7 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
                         args = json.loads(fn.get('arguments', '{}'))
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                    transcript_parts.append(json.dumps({"tool": fn.get("name", "?"), "args": args}, ensure_ascii=False))
+                    transcript_parts.append(json.dumps({"tool": fn.get("name", "?"), "arguments": args}, ensure_ascii=False))
             elif content:
                 transcript_parts.append(f"Assistant: {content}")
         elif role == "tool":

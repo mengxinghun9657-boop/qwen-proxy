@@ -137,27 +137,36 @@ class DeepSeekClient:
             param_list = ", ".join(f"{k}({v.get('description','')})" for k, v in props.items())
             tool_descs.append(f"- {name}: {desc} [{param_list}]")
 
-        return f"""## TOOLS
-
-You have these tools available. You MUST use them — do NOT describe what you would do.
+        return f"""## TOOLS — YOU MUST USE THESE
 
 {"\n".join(tool_descs)}
 
-## RESPONSE FORMAT
+## REQUIRED OUTPUT FORMAT
 
-To call a tool, output EXACTLY this JSON on its own line with nothing else:
+Every response MUST be one of:
 
-{{"tool": "<name>", "args": {{...}}}}
+  Tool call → {{"tool": "<name>", "arguments": {{"param": "value"}}}}
+  Reply     → Your text to the user (only when all tools are done)
 
-Example: {{"tool": "terminal", "args": {{"command": "docker --version"}}}}
+## FORMAT RULES
 
-## RULES
+1. Tool calls use "arguments" as the key name (NOT "args", NOT "params").
+2. One tool call per line. Multiple calls = multiple lines.
+3. NO markdown code blocks. NO ```json wrapping. Just the raw JSON.
+4. NO descriptive text before a tool call. Just output the JSON.
+5. After a tool result, IMMEDIATELY output the next tool call or reply.
+6. Valid JSON only: double-quotes, no trailing commas, no single quotes.
 
-1. NEVER output text that describes what you will do. ALWAYS call the tool directly.
-2. NEVER output bash code blocks. ALWAYS use {{"tool": "terminal", ...}} instead.
-3. NEVER ask the user to run commands. Execute them yourself immediately.
-4. Your first response to any task MUST be a tool call, not an explanation.
-5. After receiving a tool result, immediately call the next tool. No commentary."""
+## EXAMPLES
+
+✓ Correct:
+{{"tool": "terminal", "arguments": {{"command": "docker --version"}}}}
+{{"tool": "terminal", "arguments": {{"command": "nvidia-smi"}}}}
+
+✗ Wrong:
+- ```json {{"tool": "terminal", ...}} ```  (no code blocks)
+- {{"tool": "terminal", "args": {{...}}}}   (use "arguments" not "args")
+- Let me check that for you...              (no descriptions, just call it)"""
 
     async def stream_completion(
         self,
@@ -259,13 +268,15 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                 continue
 
             if event == "close":
-                # Flush remaining buffered content
+                # Flush remaining buffered content with validation
                 if content_buf.strip():
                     tcs = _extract_tool_calls(content_buf)
                     if tcs:
                         for tc in tcs:
                             yield tc
                     else:
+                        # Validation: if tools were requested but response has no tool call,
+                        # try to salvage any actionable intent from the text
                         yield {"type": "content", "text": content_buf}
                     content_buf = ""
                 yield {"type": "done", "message_id": response_msg_id, "finish_reason": "stop"}

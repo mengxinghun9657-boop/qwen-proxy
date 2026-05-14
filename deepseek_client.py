@@ -133,19 +133,22 @@ class DeepSeekClient:
             name = fn.get("name", "?")
             desc = fn.get("description", "")
             params = fn.get("parameters", {})
-            tool_descs.append(f"- {name}: {desc}\n  Parameters: {json.dumps(params, ensure_ascii=False)}")
+            props = params.get("properties", {})
+            param_list = ", ".join(f"{k}({v.get('description','')})" for k, v in props.items())
+            tool_descs.append(f"- {name}: {desc} [{param_list}]")
 
-        return f"""You have access to the following tools. To use a tool, respond with a JSON function call block:
+        return f"""You have access to these tools:
 
 {"\n".join(tool_descs)}
 
-When you need to call a tool, output ONLY this exact format on its own line, with no other text around it:
+When you need to execute a tool, respond with this JSON on a SINGLE LINE by itself:
 
-<|tool_call|>
-{{"name": "<tool_name>", "arguments": {{...}}}}
-</|tool_call|>
+{{"tool": "<tool_name>", "args": {{...}}}}
 
-After the tool call, stop immediately. Do not add any text before or after the tool call block. The user will provide the tool result, and then you can continue."""
+For example: {{"tool": "terminal", "args": {{"command": "docker --version"}}}}
+
+After the tool result, continue with the next action or respond to the user.
+Always execute tools directly rather than describing what you would do."""
 
     async def stream_completion(
         self,
@@ -277,22 +280,16 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
 
             if current_path == "response/fragments/-1/content" and isinstance(v, str):
                 content_buf += v
-                # Check for tool call markers
-                if "<|tool_call|>" in content_buf:
-                    before, rest = content_buf.split("<|tool_call|>", 1)
-                    if before.strip():
-                        yield {"type": "content", "text": before}
-                    if "</|tool_call|>" in rest:
-                        tc_json, after = rest.split("</|tool_call|>", 1)
-                        try:
-                            tc = json.loads(tc_json.strip())
-                            yield {"type": "tool_call", "name": tc.get("name", ""), "arguments": tc.get("arguments", {})}
-                        except json.JSONDecodeError:
-                            yield {"type": "content", "text": f"<|tool_call|>{tc_json}</|tool_call|>"}
-                        content_buf = after
-                    else:
-                        content_buf = "<|tool_call|>" + rest
-                elif "</|tool_call|>" in content_buf and "<|tool_call|>" not in content_buf:
+                # Try to extract tool calls: look for {"tool": ...} on its own line
+                tc = _try_extract_tool_call(content_buf)
+                if tc:
+                    if tc["_before"].strip():
+                        yield {"type": "content", "text": tc["_before"]}
+                    yield {"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]}
+                    content_buf = tc["_after"]
+                # Flush safe content periodically
+                elif len(content_buf) > 80 and "tool" not in content_buf[-40:]:
+                    yield {"type": "content", "text": content_buf}
                     content_buf = ""
 
             elif current_path.startswith("response/fragments/-1/thinking") and isinstance(v, str):
@@ -309,17 +306,32 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                         pass  # quasi finish
 
 
+def _try_extract_tool_call(text: str) -> dict | None:
+    """Try to extract a {"tool": ..., "args": {...}} call from text.
+    Returns dict with _before, name, arguments, _after if found, else None."""
+    import re
+    # Look for {"tool": "name", "args": {...}} on its own line
+    pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[^}]+\})\s*\}'
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    try:
+        name = match.group(1)
+        args = json.loads(match.group(2))
+        before = text[:match.start()]
+        after = text[match.end():]
+        return {"_before": before, "name": name, "arguments": args, "_after": after}
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
 def _extract_tool_calls(text: str) -> list[dict]:
-    """Extract any remaining <|tool_call|> blocks from buffered text."""
+    """Extract any remaining tool calls from buffered text."""
     results = []
-    remaining = text
-    while "<|tool_call|>" in remaining and "</|tool_call|>" in remaining:
-        _, rest = remaining.split("<|tool_call|>", 1)
-        tc_json, after = rest.split("</|tool_call|>", 1)
-        try:
-            tc = json.loads(tc_json.strip())
-            results.append({"type": "tool_call", "name": tc.get("name", ""), "arguments": tc.get("arguments", {})})
-        except json.JSONDecodeError:
-            pass
-        remaining = after
+    while True:
+        tc = _try_extract_tool_call(text)
+        if not tc:
+            break
+        results.append({"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]})
+        text = tc["_after"]
     return results

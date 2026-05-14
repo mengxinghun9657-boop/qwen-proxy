@@ -127,6 +127,9 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
         conv = _ds_conversations[conv_id]
         session_id = conv["session_id"]
         parent_message_id = conv.get("parent_message_id")
+        # Restore cached tools from previous turns
+        if tools is None:
+            tools = conv.get("cached_tools")
     else:
         conv_id = str(uuid.uuid4())
         session_id = await ds.create_session()
@@ -138,6 +141,10 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
             "msg_count": 0,
             "created_at": time.time(),
         }
+
+    # Cache tools for future turns in this conversation
+    if tools:
+        _ds_conversations[conv_id]["cached_tools"] = tools
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())

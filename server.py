@@ -76,23 +76,50 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
 
     # Extract system + user messages + tools
     system = None
-    user_content = None
     tools = body.get("tools")  # OpenAI tool definitions
     for m in messages:
         if m["role"] == "system":
             system = m["content"]
-    for m in reversed(messages):
-        if m["role"] == "user":
-            user_content = m["content"]
-            break
 
-    if user_content is None:
+    # Build conversation-aware prompt: include all messages for context
+    transcript_parts = []
+    last_user_content = None
+    for m in messages:
+        role = m["role"]
+        content = m.get("content")
+        tc = m.get("tool_calls")
+
+        if role == "system":
+            continue  # handled separately
+        elif role == "user":
+            last_user_content = content
+            transcript_parts.append(f"User: {content}")
+        elif role == "assistant":
+            if tc:
+                for t in tc:
+                    fn = t.get("function", {})
+                    transcript_parts.append(f"Assistant called {fn.get('name')}({fn.get('arguments')})")
+            elif content:
+                transcript_parts.append(f"Assistant: {content}")
+        elif role == "tool":
+            transcript_parts.append(f"Tool result (id={m.get('tool_call_id', '?')}): {content}")
+
+    if last_user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
 
-    if system and not tools:
-        user_content = f"[System: {system}]\n\n{user_content}"
-    elif system:
-        user_content = f"{system}\n\n{user_content}"
+    # Build the final prompt
+    if len(transcript_parts) <= 1:
+        # Single turn: just the user message
+        final_prompt = last_user_content
+        if system:
+            final_prompt = f"[System: {system}]\n\n{final_prompt}"
+    else:
+        # Multi-turn: include full transcript
+        final_prompt = "\n\n".join(transcript_parts)
+        if system:
+            final_prompt = f"[System: {system}]\n\n{final_prompt}"
+
+    user_content = final_prompt
 
     # Conversation management
     _cleanup_stale()

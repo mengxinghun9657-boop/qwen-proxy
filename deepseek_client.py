@@ -301,9 +301,10 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                         yield {"type": "content", "text": tc["_before"]}
                     yield {"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]}
                     content_buf = tc["_after"]
-                # Flush only if clearly not a tool call (no opening brace pending)
-                elif len(content_buf) > 200 and "tool" not in content_buf:
-                    # Safe to flush - no tool call pattern at all
+                # Flush only if clearly not a tool call
+                has_tool_marker = '"tool"' in content_buf
+                has_potential_tool = content_buf.strip().startswith('{"tool"') or '\n{"tool"' in content_buf
+                if len(content_buf) > 500 and not has_tool_marker and not has_potential_tool:
                     yield {"type": "content", "text": content_buf}
                     content_buf = ""
 

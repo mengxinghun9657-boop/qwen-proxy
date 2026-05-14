@@ -129,6 +129,10 @@ Continue the task. You are the SAME assistant as above. The tools results above 
         if system:
             final_prompt = f"[System: {system}]\n\n{final_prompt}"
 
+    # Anti-analysis safeguard: when tools are available, append a final reminder
+    if tools:
+        final_prompt += "\n\n⚠️  REMINDER: Your response MUST include at least one {\"tool\": ...} call. Text-only responses with plans, steps, or analysis are INVALID. Execute tools immediately, do NOT describe what you will do."
+
     user_content = final_prompt
 
     # Conversation management

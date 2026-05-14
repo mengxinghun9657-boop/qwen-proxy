@@ -287,6 +287,15 @@ class Validator:
         "\nDo NOT describe, plan, or analyze. Execute a tool immediately."
     )
 
+    # Patterns that indicate a question (not a command to execute)
+    QUESTION_MARKERS = re.compile(
+        r'[?？]|'  # question marks
+        r'^(?:can|could|would|will|did|do|does|is|are|what|why|how|when|where|who|'
+        r'能|可以|可否|是否|怎|为什么|什么|哪|谁|请|麻烦|帮|能否)\b|'
+        r'贴一下|贴出来|发出来|看一下|帮我看|告诉我|说说',
+        re.IGNORECASE | re.MULTILINE
+    )
+
     @staticmethod
     def needs_retry(collector: EventCollector, tools_requested: bool) -> bool:
         """Check if response should be retried (analysis-only, no salvageable commands)."""
@@ -297,6 +306,9 @@ class Validator:
         text = collector.full_text.strip()
         if not text:
             return True
+        # Don't salvage questions — model is asking for info, not executing
+        if Validator.QUESTION_MARKERS.search(text):
+            return False
         tcs = ToolCallParser.extract(text)
         return len(tcs) == 0  # pure analysis, nothing to salvage
 

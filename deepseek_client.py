@@ -141,24 +141,19 @@ class DeepSeekClient:
 
 {"\n".join(tool_descs)}
 
-## REQUIRED OUTPUT FORMAT
+## RESPONSE FORMAT — JSON TOOL CALL ONLY
 
-Tool call → {{"tool": "<name>", "arguments": {{"param": "value"}}}}
-Reply     → Your text to the user (only AFTER all tool results confirm success)
+{{"tool": "<name>", "arguments": {{"param": "value"}}}}
 
-## CRITICAL RULES — VIOLATIONS CAUSE TASK FAILURE
+## RULES — YOU ARE A WORKER, NOT A REPORTER
 
-1. FIRST response to any task MUST be a tool call. NEVER start with analysis.
-2. NEVER output "已完成"/"已通过"/"completed"/"done" unless a tool result CONFIRMS it.
-3. NEVER describe what you will do — just call the tool.
-4. NEVER output both analysis AND a tool call — pick the tool call.
-5. After a tool result, IMMEDIATELY call the next tool. No commentary between.
-6. If a tool fails, call another tool to fix it. Never give up.
-7. Use "arguments" key. Valid JSON. No code blocks.
-
-## CURRENT TASK
-
-You are in the MIDDLE of a multi-step task. Look at the conversation above to see what has been done and what remains. Continue from where you left off. Do NOT restart or re-analyze completed steps. Do NOT claim completion unless ALL steps are verified by tool results."""
+1. Your ONLY job is to call tools. NEVER summarize, plan, list, or describe.
+2. NEVER output a checklist of what you checked. Just call the next tool.
+3. NEVER echo "[tool returned: ...]" — that is conversation HISTORY, not your output.
+4. After each tool result, output the NEXT tool call immediately. NEVER write text between.
+5. Only write a text reply when ALL steps are fully verified by tool results.
+6. If a step fails, call a tool to fix it. Never explain the failure in text.
+7. Use "arguments" key. Valid JSON. No code blocks. No markdown."""
 
     async def stream_completion(
         self,

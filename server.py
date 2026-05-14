@@ -107,7 +107,9 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
             elif content:
                 transcript_parts.append(f"Assistant: {content}")
         elif role == "tool":
-            transcript_parts.append(f"Tool result: {content}")
+            # Truncate long tool outputs to prevent the model from echoing them
+            content_short = content[:300] + "..." if len(content) > 300 else content
+            transcript_parts.append(f"[tool returned: {content_short}]")
 
     if last_user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})

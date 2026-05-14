@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Extract reusable Claude Code skills from conversation history.
-Uses Qwen (via local proxy) to analyze user message patterns,
+Uses DeepSeek (via unified gateway at localhost:8800) to analyze user message patterns,
 then generates skill files in ~/.claude/skills/.
 
 Usage:
@@ -21,8 +21,7 @@ PROXY_URL = "http://127.0.0.1:8800/v1/chat/completions"
 HISTORY_FILE = Path.home() / ".claude/history.jsonl"
 STATE_FILE = Path(__file__).parent / "state" / "claude-history-pos"
 SKILLS_DIR = Path.home() / ".claude/skills"
-MODEL = "qwen3.6-plus"
-QWEN_PROJECT_ID = "539adf19-26a6-490f-a13d-76fdbe456691"  # Hermes project
+MODEL = "deepseek-chat"
 
 EXTRACTION_PROMPT = """You are a pattern analyst. Analyze these recent Claude Code user messages and identify patterns worth saving as reusable skills.
 
@@ -91,7 +90,7 @@ def list_existing_skills() -> list[str]:
     return [f.stem for f in SKILLS_DIR.glob("*.md")]
 
 
-def call_qwen(prompt: str) -> dict:
+def call_model(prompt: str) -> dict:
     body = {
         "model": MODEL,
         "messages": [
@@ -101,13 +100,13 @@ def call_qwen(prompt: str) -> dict:
         "stream": False,
     }
     try:
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(PROXY_URL, json=body, headers={
-                "x-project-id": QWEN_PROJECT_ID,
-            })
+        # Strip ALL_PROXY (httpx doesn't support socks://, localhost doesn't need proxy)
+        for key in ("ALL_PROXY", "all_proxy"):
+            os.environ.pop(key, None)
+        with httpx.Client(timeout=120, trust_env=False) as client:
+            resp = client.post(PROXY_URL, json=body)
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
-            # Strip markdown fences if present
             content = content.strip()
             if content.startswith("```"):
                 content = content.split("\n", 1)[1]
@@ -115,7 +114,7 @@ def call_qwen(prompt: str) -> dict:
                     content = content[:-3]
             return json.loads(content)
     except Exception as e:
-        print(f"Error calling Qwen: {e}", file=sys.stderr)
+        print(f"Error calling {MODEL}: {e}", file=sys.stderr)
         return {"skills_found": [], "summary": str(e)}
 
 
@@ -169,7 +168,7 @@ def main():
     if existing:
         prompt += f"\n\nExisting skills (do not duplicate): {existing}"
 
-    result = call_qwen(prompt)
+    result = call_model(prompt)
     skills = result.get("skills_found", [])
     summary = result.get("summary", "no summary")
 

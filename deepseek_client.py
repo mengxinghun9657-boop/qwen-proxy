@@ -392,9 +392,9 @@ def _try_extract_tool_call(text: str) -> dict | None:
                         pass
 
     # ── Layer 2: tool_name({"arg": "value"}) function-call format ──
-    fn_pattern = r'\b(terminal|write_file|read_file|search_files|process|todo|memory|'
-    fn_pattern += r'browser_navigate|browser_click|browser_snapshot|browser_type|'
-    fn_pattern += r'skill_view|skills_list|delegate_task|cronjob)\s*\(\s*\{'
+    # ── Layer 2: tool_name({"arg": "value"}) function-call format ──
+    # Accept any lowercase tool name (no hardcoded list)
+    fn_pattern = r'\b([a-z][a-z0-9_]{2,40})\s*\(\s*\{'
     m = re.search(fn_pattern, text)
     if m:
         name = m.group(1)
@@ -421,8 +421,7 @@ def _try_extract_tool_call(text: str) -> dict | None:
                 pass
 
     # ── Layer 3: OpenAI bare format {"name":"terminal","arguments":{...}} ──
-    fn_names = r'(?:terminal|write_file|read_file|search_files|process|todo|memory|browser_navigate|delegate_task|cronjob|skill_view)'
-    m = re.search(r'\{\s*"name"\s*:\s*"' + fn_names + r'"\s*,\s*"(?:arguments|args|params)"\s*:\s*\{', text)
+    m = re.search(r'\{\s*"name"\s*:\s*"' + r'([a-z][a-z0-9_]{2,40})' + r'"\s*,\s*"(?:arguments|args|params)"\s*:\s*\{', text)
     if m:
         name_match = re.search(r'"name"\s*:\s*"([^"]+)"', m.group())
         name = name_match.group(1) if name_match else "terminal"
@@ -476,8 +475,7 @@ def _try_extract_tool_call(text: str) -> dict | None:
 
     # ── Layer 5: ReAct format "Action:..." ── "Action: X\nAction Input: {...}" ──
     m = re.search(
-        r'Action\s*:\s*(terminal|write_file|read_file|search_files|process|'
-        r'todo|memory|browser_navigate)\s*\n\s*'
+        r'Action\s*:\s*([a-z][a-z0-9_]{2,40})\s*\n\s*'
         r'Action\s*Input\s*:\s*(\{[^}]+\})',
         text, re.IGNORECASE
     )

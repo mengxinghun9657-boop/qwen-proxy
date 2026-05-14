@@ -249,10 +249,17 @@ Continue the task. You are the SAME assistant as above. The tools results above 
         # Wrap streaming to prevent empty responses reaching Hermes
         async def guarded_stream() -> AsyncGenerator[str, None]:
             has_output = False
+            chunks_buf = []
             async for chunk in sse_stream():
-                has_output = True
-                yield chunk
-            if not has_output:
+                chunks_buf.append(chunk)
+                # Check for real content in this chunk
+                if '"content"' in chunk or '"tool_calls"' in chunk:
+                    has_output = True
+            # Replay buffered chunks (or fallback)
+            if has_output:
+                for chunk in chunks_buf:
+                    yield chunk
+            else:
                 # Stream produced nothing — emit minimal fallback
                 fb = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": "."}, "finish_reason": None}]}
                 yield f"data: {json.dumps(fb, ensure_ascii=False)}\n\n"

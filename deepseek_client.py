@@ -322,25 +322,57 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
 
 
 def _try_extract_tool_call(text: str) -> dict | None:
-    """Try to extract a tool call from text. Supports two formats:
-    1. {"tool": "name", "args": {...}} JSON format
-    2. ```bash ... ``` markdown code block (converted to terminal tool call)
+    """Try to extract a tool call from text.
     Returns dict with _before, name, arguments, _after if found, else None.
     """
     import re
 
-    # Format 1: JSON tool call
-    pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[^}]+\})\s*\}'
-    match = re.search(pattern, text)
+    # Format 1: JSON tool call — find {"tool": "name", "args": by depth-matching braces
+    start_pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*\{'
+    match = re.search(start_pattern, text)
     if match:
-        try:
-            name = match.group(1)
-            args = json.loads(match.group(2))
-            before = text[:match.start()]
-            after = text[match.end():]
-            return {"_before": before, "name": name, "arguments": args, "_after": after}
-        except (json.JSONDecodeError, KeyError):
-            pass
+        name = match.group(1)
+        args_start = match.end() - 1  # position of the opening { of args
+        # Find matching closing brace tracking strings and brace depth
+        depth = 0
+        in_string = False
+        escape_next = False
+        args_end = -1
+        for i in range(args_start, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == '\\':
+                escape_next = True
+                continue
+            if c == '"' and not in_string:
+                in_string = True
+                continue
+            if c == '"' and in_string:
+                in_string = False
+                continue
+            if in_string:
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    args_end = i + 1
+                    break
+        if args_end > 0:
+            # Now find the closing } of the tool call itself
+            rest = text[args_end:].lstrip()
+            if rest.startswith('}'):
+                args_json = text[args_start:args_end]
+                try:
+                    args = json.loads(args_json)
+                    before = text[:match.start()]
+                    after = text[args_end + 1:]  # skip the closing }
+                    return {"_before": before, "name": name, "arguments": args, "_after": after}
+                except json.JSONDecodeError:
+                    pass
 
     # Format 2: bash code block — extract first command as terminal call
     bash_pattern = r'```bash\s*\n(.*?)\n```'
@@ -351,17 +383,6 @@ def _try_extract_tool_call(text: str) -> dict | None:
             before = text[:match.start()]
             after = text[match.end():]
             return {"_before": before, "name": "terminal", "arguments": {"command": command}, "_after": after}
-
-    # Format 3: inline `command` — extract single backtick command
-    cmd_pattern = r'`([^`]+)`'
-    match = re.search(cmd_pattern, text)
-    if match:
-        cmd = match.group(1).strip()
-        # Only if it looks like a real command (not inline code)
-        if any(cmd.startswith(p) for p in ('docker', 'nvidia', 'curl', 'pip', 'python', 'ls ', 'cat ', 'mkdir', 'cd ', 'git ')):
-            before = text[:match.start()]
-            after = text[match.end():]
-            return {"_before": before, "name": "terminal", "arguments": {"command": cmd}, "_after": after}
 
     return None
 

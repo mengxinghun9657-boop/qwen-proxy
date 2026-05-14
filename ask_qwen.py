@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ask Qwen a question via the local reverse proxy.
+"""Ask any model (Qwen / DeepSeek / MiniMax) via the unified LLM gateway.
 
 Usage:
   python ask_qwen.py "your question"
@@ -7,10 +7,12 @@ Usage:
   python ask_qwen.py -M concise "quick question"
   python ask_qwen.py -s "You are a debugger" -M diagnose "why does this crash?"
   python ask_qwen.py -c <conv_id> "follow-up question"
-  python ask_qwen.py -m qwen3.6-max-preview -M review "code here"
+  python ask_qwen.py -m deepseek-chat -M review "code here"
+  python ask_qwen.py -m MiniMax-M2.7 "creative writing task"
   python ask_qwen.py --list-models
 
-Output: Qwen's response text to stdout.
+Supported backends: Qwen, DeepSeek, MiniMax (via localhost:8800 gateway).
+Output: model's response text to stdout.
 Errors go to stderr, return code != 0 on failure.
 """
 
@@ -151,7 +153,10 @@ def ask(
         headers["x-project-id"] = project_id
 
     try:
-        with httpx.Client(timeout=300, http2=True) as client:
+        # Strip ALL_PROXY — httpx doesn't support socks:// and localhost doesn't need proxy
+        for _key in ("ALL_PROXY", "all_proxy"):
+            os.environ.pop(_key, None)
+        with httpx.Client(timeout=300, http2=True, trust_env=False) as client:
             resp = client.post(
                 f"{PROXY_BASE}/v1/chat/completions",
                 json=body,
@@ -199,9 +204,14 @@ def ask(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Ask Qwen via local proxy (with compression presets)",
+        description="Ask any model via unified LLM gateway (Qwen / DeepSeek / MiniMax)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Compression modes:
+        epilog="""Backends (via localhost:8800):
+  Qwen     - qwen3.6-plus (default), qwen3.6-max-preview, qwen3.5-plus, ...
+  DeepSeek - deepseek-chat, deepseek-reasoner
+  MiniMax  - MiniMax-M2.7 (with thinking), MiniMax-M2.5
+
+Compression modes:
   concise   - 150 words max, conclusion first
   diagnose  - Root cause + fix + alternative, 100 words
   review    - Severity-tagged findings + summary, 200 words
@@ -211,6 +221,8 @@ def main():
 
 Examples:
   python ask_qwen.py "explain this error"
+  python ask_qwen.py -m deepseek-chat "summarize this document"
+  python ask_qwen.py -m MiniMax-M2.7 "write a creative story"
   python ask_qwen.py -M concise "what is a bloom filter?"
   python ask_qwen.py -M diagnose "why does this segfault?"
   python ask_qwen.py -M review "review this code: $(cat bug.go)"
@@ -218,13 +230,13 @@ Examples:
   python ask_qwen.py -M json "analyze this SQL query"
   python ask_qwen.py -w 50 "extremely short answer"
   python ask_qwen.py -c debug -M diagnose "what else could cause this?"
-  python ask_qwen.py -m qwen3.6-max-preview -M review "complex code"
+  python ask_qwen.py -m deepseek-reasoner -M review "complex code"
   python ask_qwen.py --list-models
   python ask_qwen.py --list-modes""",
     )
     parser.add_argument("prompt", nargs="?", help="Question to ask (or use stdin)")
     parser.add_argument("-s", "--system", help="System prompt (role definition)")
-    parser.add_argument("-m", "--model", default="qwen3.6-plus", help="Model to use")
+    parser.add_argument("-m", "--model", default="qwen3.6-plus", help="Model to use (qwen/deepseek/minimax)")
     parser.add_argument("-M", "--mode", help="Compression preset (concise, diagnose, review, keypoints, judge, json)")
     parser.add_argument("-w", "--max-words", type=int, help="Max words in response")
     parser.add_argument("-c", "--conversation", help="Conversation ID for multi-turn")

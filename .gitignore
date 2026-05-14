@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .qwen_conversations.json
 qwen_config.json
+deepseek_config.json
+minimax_config.json

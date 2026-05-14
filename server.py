@@ -8,12 +8,44 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from session import SessionManager, TokenStatus
 from qwen_client import QwenClient, extract_content, extract_final_usage, extract_parent_id
+from deepseek_client import DeepSeekClient, load_token as load_ds_token
+from minimax_client import MinimaxClient, load_api_key as load_mm_key, MINIMAX_MODELS
 
-app = FastAPI(title="qwen-proxy", version="1.0.0")
+app = FastAPI(title="unified-llm-gateway", version="2.0.0")
 session = SessionManager()
 
 # In-memory conversation store: conv_id -> {chat_id, parent_id, model, msg_count, created_at}
 _conversations: dict[str, dict] = {}
+_ds_conversations: dict[str, dict] = {}
+_mm_conversations: dict[str, dict] = {}
+
+# Lazy-initialized clients
+_ds_client: DeepSeekClient | None = None
+_mm_client: MinimaxClient | None = None
+
+DEEPSEEK_MODELS = {"deepseek-chat", "deepseek-reasoner", "deepseek-r1"}
+
+
+def _is_deepseek(model_id: str) -> bool:
+    return model_id in DEEPSEEK_MODELS or model_id.startswith("deepseek")
+
+
+def _is_minimax(model_id: str) -> bool:
+    return model_id in MINIMAX_MODELS or model_id.lower().startswith("minimax")
+
+
+async def _get_ds_client() -> DeepSeekClient:
+    global _ds_client
+    if _ds_client is None:
+        _ds_client = DeepSeekClient()
+    return _ds_client
+
+
+async def _get_mm_client() -> MinimaxClient:
+    global _mm_client
+    if _mm_client is None:
+        _mm_client = MinimaxClient()
+    return _mm_client
 
 
 def _cleanup_stale():
@@ -22,6 +54,295 @@ def _cleanup_stale():
     stale = [cid for cid, c in _conversations.items() if now - c["created_at"] > 3600]
     for cid in stale:
         del _conversations[cid]
+    stale2 = [cid for cid, c in _ds_conversations.items() if now - c["created_at"] > 3600]
+    for cid in stale2:
+        del _ds_conversations[cid]
+    stale3 = [cid for cid, c in _mm_conversations.items() if now - c.get("created_at", 0) > 3600]
+    for cid in stale3:
+        del _mm_conversations[cid]
+
+
+async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | None, request: Request):
+    """Handle DeepSeek chat completions with OpenAI-compatible output."""
+    messages = body.get("messages", [])
+    model = body.get("model", "deepseek-chat")
+
+    # Auth check
+    token = load_ds_token()
+    if not token:
+        raise HTTPException(401, detail={"error": {"message": "No DeepSeek token configured", "type": "auth_error"}})
+
+    ds = await _get_ds_client()
+
+    # Extract system + user messages
+    system = None
+    user_content = None
+    for m in messages:
+        if m["role"] == "system":
+            system = m["content"]
+    for m in reversed(messages):
+        if m["role"] == "user":
+            user_content = m["content"]
+            break
+
+    if user_content is None:
+        raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
+
+    if system:
+        user_content = f"[System: {system}]\n\n{user_content}"
+
+    # Conversation management
+    _cleanup_stale()
+    if conv_id and conv_id in _ds_conversations:
+        conv = _ds_conversations[conv_id]
+        session_id = conv["session_id"]
+        parent_message_id = conv.get("parent_message_id")
+    else:
+        conv_id = str(uuid.uuid4())
+        session_id = await ds.create_session()
+        parent_message_id = None
+        _ds_conversations[conv_id] = {
+            "session_id": session_id,
+            "parent_message_id": None,
+            "model": model,
+            "msg_count": 0,
+            "created_at": time.time(),
+        }
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    async def sse_stream() -> AsyncGenerator[str, None]:
+        nonlocal parent_message_id
+        async for ev in ds.stream_completion(
+            session_id=session_id,
+            prompt=user_content,
+            parent_message_id=parent_message_id,
+            thinking=True if "reasoner" in model or "r1" in model else False,
+        ):
+            if ev["type"] == "content":
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif ev["type"] == "done":
+                # Update parent_message_id for next turn
+                if ev.get("message_id"):
+                    parent_message_id = ev["message_id"]
+                    _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
+                # Echo session_id for client tracking
+                _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
+
+        final = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    if stream:
+        return StreamingResponse(
+            sse_stream(),
+            media_type="text/event-stream",
+            headers={"x-conversation-id": conv_id},
+        )
+
+    # Non-streaming: accumulate
+    full_content = ""
+    final_msg_id = None
+    async for ev in ds.stream_completion(
+        session_id=session_id,
+        prompt=user_content,
+        parent_message_id=parent_message_id,
+        thinking=True if "reasoner" in model or "r1" in model else False,
+    ):
+        if ev["type"] == "content":
+            full_content += ev["text"]
+        elif ev["type"] == "done":
+            if ev.get("message_id"):
+                parent_message_id = ev["message_id"]
+                _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
+            _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
+
+    return JSONResponse({
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": full_content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }, headers={"x-conversation-id": conv_id})
+
+
+async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | None):
+    """Handle MiniMax chat completions via Anthropic-compatible API.
+
+    The Anthropic API is stateless, so the gateway accumulates message history
+    keyed by conv_id and replays the full context on each request.
+    """
+    messages = body.get("messages", [])
+    model = body.get("model", "MiniMax-M2.7")
+
+    if not load_mm_key():
+        raise HTTPException(401, detail={"error": {"message": "No MiniMax API key configured", "type": "auth_error"}})
+
+    mm = await _get_mm_client()
+
+    # --- Conversation management ---
+    _cleanup_stale()
+    new_conv_id = conv_id or str(uuid.uuid4())
+
+    if new_conv_id in _mm_conversations:
+        conv = _mm_conversations[new_conv_id]
+        # Merge new messages into stored history (avoid duplicates by content+role)
+        stored_msgs = conv.get("messages", [])
+        for m in messages:
+            if m not in stored_msgs:
+                stored_msgs.append(m)
+        conv["messages"] = stored_msgs
+        conv["last_access"] = time.time()
+        history_messages = stored_msgs
+    else:
+        _mm_conversations[new_conv_id] = {
+            "model": model,
+            "messages": list(messages),
+            "created_at": time.time(),
+            "last_access": time.time(),
+        }
+        history_messages = messages
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    async def sse_stream() -> AsyncGenerator[str, None]:
+        full_content = ""
+        async for ev in mm.stream_completion(
+            messages=history_messages,
+            model=model,
+            max_tokens=body.get("max_tokens", 4096),
+            thinking=body.get("thinking", True) if isinstance(body.get("thinking"), bool) else True,
+            thinking_budget=body.get("thinking_budget", 4096) if isinstance(body.get("thinking_budget"), int) else 4096,
+            stream=True,
+        ):
+            if ev["type"] == "content":
+                full_content += ev["text"]
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif ev["type"] == "thinking":
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": ev["text"]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif ev["type"] == "done":
+                usage = ev.get("usage", {})
+                final: dict = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                if usage:
+                    final["usage"] = {
+                        "prompt_tokens": usage.get("input_tokens", 0),
+                        "completion_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                    }
+                yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            elif ev["type"] == "error":
+                err_chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                    "error": {"message": ev["message"], "type": "upstream_error"},
+                }
+                yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+        # Store assistant response in the conversation for future turns
+        if full_content and new_conv_id in _mm_conversations:
+            msgs = _mm_conversations[new_conv_id].get("messages", [])
+            msgs.append({"role": "assistant", "content": full_content})
+            _mm_conversations[new_conv_id]["last_access"] = time.time()
+
+    if stream:
+        return StreamingResponse(
+            sse_stream(),
+            media_type="text/event-stream",
+            headers={"x-conversation-id": new_conv_id},
+        )
+
+    # Non-streaming: accumulate
+    full_content = ""
+    full_reasoning = ""
+    usage = {}
+    async for ev in mm.stream_completion(
+        messages=history_messages,
+        model=model,
+        max_tokens=body.get("max_tokens", 4096),
+        thinking=body.get("thinking", True) if isinstance(body.get("thinking"), bool) else True,
+        thinking_budget=body.get("thinking_budget", 4096) if isinstance(body.get("thinking_budget"), int) else 4096,
+        stream=True,
+    ):
+        if ev["type"] == "content":
+            full_content += ev["text"]
+        elif ev["type"] == "thinking":
+            full_reasoning += ev["text"]
+        elif ev["type"] == "done":
+            usage = ev.get("usage", {})
+        elif ev["type"] == "error":
+            raise HTTPException(502, detail={"error": {"message": ev["message"], "type": "upstream_error"}})
+
+    # Store response for conversation continuity
+    if full_content and new_conv_id in _mm_conversations:
+        msgs = _mm_conversations[new_conv_id].get("messages", [])
+        msgs.append({"role": "assistant", "content": full_content})
+        _mm_conversations[new_conv_id]["last_access"] = time.time()
+
+    resp: dict = {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": full_content},
+            "finish_reason": "stop",
+        }],
+    }
+    if full_reasoning:
+        resp["choices"][0]["message"]["reasoning_content"] = full_reasoning
+    if usage:
+        resp["usage"] = {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+        }
+    return JSONResponse(resp, headers={"x-conversation-id": new_conv_id})
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +357,15 @@ async def chat_completions(request: Request):
     stream = body.get("stream", True)
     conv_id = request.headers.get("x-conversation-id")
 
-    # --- token validation ---
+    # --- route DeepSeek models ---
+    if _is_deepseek(model):
+        return await _chat_completions_deepseek(body, stream, conv_id, request)
+
+    # --- route MiniMax models ---
+    if _is_minimax(model):
+        return await _chat_completions_minimax(body, stream, conv_id)
+
+    # --- token validation (Qwen) ---
     health = await session.health()
     if health["status"] == "no_token":
         raise HTTPException(401, detail={"error": {"message": "No token configured. PUT /token with your Qwen bearer token.", "type": "auth_error"}})
@@ -177,18 +506,34 @@ async def chat_completions(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
+    models = []
+
+    # DeepSeek models (always available if token configured)
+    if load_ds_token():
+        models.append({"id": "deepseek-chat", "object": "model", "created": 0, "owned_by": "deepseek"})
+        models.append({"id": "deepseek-reasoner", "object": "model", "created": 0, "owned_by": "deepseek"})
+
+    # MiniMax models (always available if API key configured)
+    if load_mm_key():
+        models.append({"id": "MiniMax-M2.7", "object": "model", "created": 0, "owned_by": "minimax"})
+        models.append({"id": "MiniMax-M2.5", "object": "model", "created": 0, "owned_by": "minimax"})
+
+    # Qwen models
     health = await session.health()
     if health["status"] == "no_token":
-        raise HTTPException(401, detail={"error": {"message": "No token configured", "type": "auth_error"}})
+        if not models:
+            raise HTTPException(401, detail={"error": {"message": "No token configured", "type": "auth_error"}})
+        return JSONResponse({"object": "list", "data": models})
 
     token = session.load_token()
     client = QwenClient(token)
     try:
         raw = await client.list_models()
     except Exception as e:
+        if models:
+            return JSONResponse({"object": "list", "data": models})
         raise HTTPException(502, detail={"error": {"message": f"Failed to fetch models: {e}", "type": "upstream_error"}})
 
-    models = []
     for m in raw:
         models.append({
             "id": m["id"],
@@ -209,12 +554,13 @@ ADMIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen Proxy - Admin</title>
+<title>Unified LLM Gateway - Admin</title>
 <style>
   :root {
     --bg: #0f172a; --card: #1e293b; --border: #334155;
     --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
     --green: #22c55e; --red: #ef4444; --amber: #f59e0b;
+    --ds: #6366f1; --qw: #38bdf8; --mm: #ec4899;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font: 14px/1.6 system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
@@ -274,8 +620,8 @@ ADMIN_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="app">
-  <h1>Qwen Proxy</h1>
-  <div class="subtitle">Admin Dashboard · <span id="serverTime">--</span></div>
+  <h1>Unified LLM Gateway</h1>
+  <div class="subtitle">Qwen + DeepSeek + MiniMax · <span id="serverTime">--</span></div>
 
   <div class="grid" id="statusCards"></div>
 
@@ -298,6 +644,40 @@ ADMIN_HTML = """<!DOCTYPE html>
       <button class="btn-primary mt-2" onclick="updateToken()">保存 Token</button>
     </div>
     <div class="mt-2" id="lastUpdated" style="font-size:11px;color:var(--muted)"></div>
+  </div>
+
+  <div class="card mb-4" style="border-left: 3px solid var(--ds)">
+    <h3 style="margin-bottom:12px;color:var(--ds)">DeepSeek 配置</h3>
+    <div class="flex-between mb-2">
+      <span style="font-size:12px;color:var(--muted)">Token 状态</span>
+      <span id="dsStatus" class="text-sm">--</span>
+    </div>
+    <div>
+      <label>Token 预览</label>
+      <div class="mono" id="dsTokenPreview">--</div>
+    </div>
+    <div class="mt-4">
+      <label for="newDsToken">更新 DeepSeek Token（从 chat.deepseek.com Local Storage）</label>
+      <textarea id="newDsToken" placeholder="粘贴 userToken..."></textarea>
+      <button class="btn-primary mt-2" onclick="updateDsToken()">保存 Token</button>
+    </div>
+  </div>
+
+  <div class="card mb-4" style="border-left: 3px solid #ec4899">
+    <h3 style="margin-bottom:12px;color:#ec4899">MiniMax 配置</h3>
+    <div class="flex-between mb-2">
+      <span style="font-size:12px;color:var(--muted)">API Key 状态</span>
+      <span id="mmStatus" class="text-sm">--</span>
+    </div>
+    <div>
+      <label>Key 预览</label>
+      <div class="mono" id="mmTokenPreview">--</div>
+    </div>
+    <div class="mt-4">
+      <label for="newMmToken">更新 MiniMax API Key</label>
+      <textarea id="newMmToken" placeholder="粘贴 MiniMax API key..."></textarea>
+      <button class="btn-primary mt-2" onclick="updateMmToken()">保存 Key</button>
+    </div>
   </div>
 
   <div class="card mb-4">
@@ -372,17 +752,45 @@ async function refresh() {
     try { localStorage.setItem(TOKEN_KEY, health._raw_token || ''); } catch(e) {}
   }
 
-  document.getElementById('statusCards').innerHTML =
-    `<div class="card">
-      <h3>Token 状态</h3>
+  // Qwen status cards
+  let qwenHtml =
+    `<div class="card" style="border-left: 3px solid var(--qw)">
+      <h3 style="color:var(--qw)">Qwen 后端</h3>
       <div class="flex">${statusHtml(health.status)}</div>
       <div class="text-muted text-sm mt-2">${health.message}</div>
-    </div>
-    <div class="card">
-      <h3>远程验证</h3>
-      <div class="flex">${statusHtml(health.status === 'no_token' ? 'no_token' : health.status)}</div>
-      <div class="text-muted text-sm mt-2">${health.status === 'valid' ? 'API 连通正常' : health.message}</div>
     </div>`;
+
+  // DeepSeek status
+  let dsHealth = {status: 'unknown', message: '检查中...'};
+  try { dsHealth = await api('/health/ds'); } catch(e) { dsHealth.message = e.message; }
+  document.getElementById('dsStatus').innerHTML = dsHealth.status === 'ok'
+    ? '<span class="status-dot dot-valid"></span><span class="badge badge-valid">有效</span>'
+    : '<span class="status-dot dot-expired"></span><span class="badge badge-expired">异常</span>';
+  document.getElementById('dsTokenPreview').textContent = dsHealth.status === 'ok' ? dsHealth.session_id : dsHealth.message;
+
+  let dsHtml =
+    `<div class="card" style="border-left: 3px solid var(--ds)">
+      <h3 style="color:var(--ds)">DeepSeek 后端</h3>
+      <div class="flex">${dsHealth.status === 'ok' ? '<span class="status-dot dot-valid"></span><span class="badge badge-valid">连通</span>' : '<span class="status-dot dot-expired"></span><span class="badge badge-expired">异常</span>'}</div>
+      <div class="text-muted text-sm mt-2">${dsHealth.message}</div>
+    </div>`;
+
+  // MiniMax status
+  let mmHealth = {status: 'unknown', message: '检查中...'};
+  try { mmHealth = await api('/health/minimax'); } catch(e) { mmHealth.message = e.message; }
+  document.getElementById('mmStatus').innerHTML = mmHealth.status === 'ok'
+    ? '<span class="status-dot dot-valid"></span><span class="badge badge-valid">有效</span>'
+    : '<span class="status-dot dot-expired"></span><span class="badge badge-expired">异常</span>';
+  document.getElementById('mmTokenPreview').textContent = mmHealth.status === 'ok' ? mmHealth.message : mmHealth.message;
+
+  let mmHtml =
+    `<div class="card" style="border-left: 3px solid #ec4899">
+      <h3 style="color:#ec4899">MiniMax 后端</h3>
+      <div class="flex">${mmHealth.status === 'ok' ? '<span class="status-dot dot-valid"></span><span class="badge badge-valid">连通</span>' : '<span class="status-dot dot-expired"></span><span class="badge badge-expired">异常</span>'}</div>
+      <div class="text-muted text-sm mt-2">${mmHealth.message}</div>
+    </div>`;
+
+  document.getElementById('statusCards').innerHTML = qwenHtml + dsHtml + mmHtml;
 
   // Models
   loadModels();
@@ -406,10 +814,20 @@ async function loadModels() {
     const data = await api('/v1/models');
     if (!data.data || !data.data.length) { el.textContent = '无模型数据'; return; }
     await loadDefaultModel();
-    el.innerHTML = data.data.map(m => {
+    // Sort by backend then name
+    const backendOrder = {deepseek: 0, qwen: 1, minimax: 2};
+    const backendColors = {deepseek: 'var(--ds)', qwen: 'var(--qw)', minimax: '#ec4899'};
+    const backendLabels = {deepseek: 'DS', qwen: 'QW', minimax: 'MM'};
+    const sorted = [...data.data].sort((a, b) => {
+      if (a.owned_by !== b.owned_by) return (backendOrder[a.owned_by] ?? 3) - (backendOrder[b.owned_by] ?? 3);
+      return a.id.localeCompare(b.id);
+    });
+    el.innerHTML = sorted.map(m => {
       const isActive = m.id === defaultModel;
-      return `<span class="model-tag${isActive ? ' active' : ''}" onclick="setDefaultModel('${m.id.replace(/'/g, "\\'")}')" title="${isActive ? '当前默认' : '点击设为默认'}">
-        ${m.id}<span class="set-default">${isActive ? '✓ 默认' : '设为默认'}</span>
+      const color = backendColors[m.owned_by] || 'var(--muted)';
+      const label = backendLabels[m.owned_by] || m.owned_by.slice(0,2).toUpperCase();
+      return `<span class="model-tag${isActive ? ' active' : ''}" onclick="setDefaultModel('${m.id.replace(/'/g, "\\'")}')" title="${isActive ? '当前默认' : '点击设为默认'} (${m.owned_by})">
+        <span style="font-size:9px;padding:1px 4px;border-radius:3px;background:${color};color:#fff;margin-right:4px">${label}</span>${m.id}<span class="set-default">${isActive ? '✓ 默认' : '设为默认'}</span>
       </span>`;
     }).join('');
   } catch(e) {
@@ -507,6 +925,36 @@ async function copyToken() {
   } catch(e) { toast('复制失败: ' + e.message, false); }
 }
 
+async function updateDsToken() {
+  const val = document.getElementById('newDsToken').value.trim();
+  if (!val) { toast('请先粘贴 token', false); return; }
+  try {
+    await api('/token/ds', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: val}),
+    });
+    document.getElementById('newDsToken').value = '';
+    toast('DeepSeek Token 已更新', true);
+    refresh();
+  } catch(e) { toast('保存失败: ' + e.message, false); }
+}
+
+async function updateMmToken() {
+  const val = document.getElementById('newMmToken').value.trim();
+  if (!val) { toast('请先粘贴 API key', false); return; }
+  try {
+    await api('/token/minimax', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: val}),
+    });
+    document.getElementById('newMmToken').value = '';
+    toast('MiniMax API Key 已更新', true);
+    refresh();
+  } catch(e) { toast('保存失败: ' + e.message, false); }
+}
+
 refresh();
 setInterval(refresh, 30000);
 </script>
@@ -555,6 +1003,80 @@ async def update_token(request: Request):
         "status": health["status"],
         "message": health["message"],
     })
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek token management
+# ---------------------------------------------------------------------------
+
+@app.get("/health/ds")
+async def health_ds():
+    token = load_ds_token()
+    if not token:
+        return JSONResponse({"status": "no_token", "message": "未配置 DeepSeek token"})
+    try:
+        ds = await _get_ds_client()
+        sid = await ds.create_session()
+        return JSONResponse({"status": "ok", "session_id": sid, "message": "DeepSeek API 连通正常"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.get("/token/ds")
+async def get_token_ds():
+    token = load_ds_token()
+    if not token:
+        raise HTTPException(404, detail={"error": {"message": "No DeepSeek token configured", "type": "not_found"}})
+    return JSONResponse({"token": token})
+
+
+@app.put("/token/ds")
+async def update_token_ds(request: Request):
+    body = await request.json()
+    new_token = body.get("token", "").strip()
+    if not new_token:
+        raise HTTPException(400, detail={"error": {"message": "token is required"}})
+    from deepseek_client import _load_config, _save_config
+    _save_config({"token": new_token})
+    return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# MiniMax token management
+# ---------------------------------------------------------------------------
+
+@app.get("/health/minimax")
+async def health_minimax():
+    api_key = load_mm_key()
+    if not api_key:
+        return JSONResponse({"status": "no_token", "message": "未配置 MiniMax API key"})
+    mm = await _get_mm_client()
+    try:
+        result = await mm.health_check()
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.get("/token/minimax")
+async def get_token_minimax():
+    api_key = load_mm_key()
+    if not api_key:
+        raise HTTPException(404, detail={"error": {"message": "No MiniMax API key configured", "type": "not_found"}})
+    return JSONResponse({"token": api_key[:8] + "..." + api_key[-4:]})
+
+
+@app.put("/token/minimax")
+async def update_token_minimax(request: Request):
+    body = await request.json()
+    new_key = body.get("token", "").strip()
+    if not new_key:
+        raise HTTPException(400, detail={"error": {"message": "token is required"}})
+    from minimax_client import _save_config
+    _save_config({"api_key": new_key})
+    global _mm_client
+    _mm_client = None
+    return JSONResponse({"ok": True})
 
 
 # ---------------------------------------------------------------------------

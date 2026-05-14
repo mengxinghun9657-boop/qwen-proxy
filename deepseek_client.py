@@ -125,6 +125,28 @@ class DeepSeekClient:
         log.info("deepseek pow solved for %s in %.2fs", target, time.monotonic() - t0)
         return resp
 
+    def _format_tools_prompt(self, tools: list[dict]) -> str:
+        """Convert OpenAI tools array to a prompt that instructs DeepSeek to emit function calls."""
+        tool_descs = []
+        for t in tools:
+            fn = t.get("function", {})
+            name = fn.get("name", "?")
+            desc = fn.get("description", "")
+            params = fn.get("parameters", {})
+            tool_descs.append(f"- {name}: {desc}\n  Parameters: {json.dumps(params, ensure_ascii=False)}")
+
+        return f"""You have access to the following tools. To use a tool, respond with a JSON function call block:
+
+{"\n".join(tool_descs)}
+
+When you need to call a tool, output ONLY this exact format on its own line, with no other text around it:
+
+<|tool_call|>
+{{"name": "<tool_name>", "arguments": {{...}}}}
+</|tool_call|>
+
+After the tool call, stop immediately. Do not add any text before or after the tool call block. The user will provide the tool result, and then you can continue."""
+
     async def stream_completion(
         self,
         *,
@@ -133,14 +155,20 @@ class DeepSeekClient:
         parent_message_id: int | None = None,
         thinking: bool = False,
         search: bool = False,
+        tools: list[dict] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         target = "/api/v0/chat/completion"
         pow_resp = await self._solve_pow(target)
 
+        final_prompt = prompt
+        if tools:
+            tool_instructions = self._format_tools_prompt(tools)
+            final_prompt = f"[System: {tool_instructions}]\n\n{prompt}"
+
         body = {
             "chat_session_id": session_id,
             "parent_message_id": parent_message_id,
-            "prompt": prompt,
+            "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking,
             "search_enabled": search,
@@ -183,18 +211,14 @@ class DeepSeekClient:
 async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
     """Parse DeepSeek SSE stream into canonical events.
 
-    DeepSeek uses a p/v/o path-based delta model:
-      {"p": "response/fragments/-1/content", "o": "APPEND", "v": "text"}  — new path + op
-      {"v": "more text"}                                                   — continues previous path
-      {"p": "response", "o": "BATCH", "v": [...]}                        — batch update
-      {"p": "response/status", "o": "SET", "v": "FINISHED"}             — status change
-
-    Events: ready, update_session, title, close
+    DeepSeek uses a p/v/o path-based delta model.
+    Also detects <|tool_call|> blocks in content and yields structured tool_call events.
     """
     event: str | None = None
     current_path: str = ""
     response_msg_id: int | None = None
     buf = ""
+    content_buf = ""  # buffer for detecting tool call blocks
 
     async for text in r.aiter_text():
         buf += text
@@ -204,7 +228,6 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
             if not line:
                 continue
 
-            # --- SSE event line ---
             if line.startswith("event:"):
                 event = line[6:].strip()
                 continue
@@ -217,13 +240,17 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
 
-            # --- Handle events ---
             if event == "ready":
                 response_msg_id = chunk.get("response_message_id")
                 event = None
                 continue
 
             if event == "close":
+                # Flush remaining buffered content
+                if content_buf.strip():
+                    for tc in _extract_tool_calls(content_buf):
+                        yield tc
+                    content_buf = ""
                 yield {"type": "done", "message_id": response_msg_id, "finish_reason": "stop"}
                 return
 
@@ -233,7 +260,6 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
 
             event = None
 
-            # --- Path / Op / Value model ---
             p = chunk.get("p")
             o = chunk.get("o")
             v = chunk.get("v")
@@ -241,32 +267,59 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
             if p:
                 current_path = p
 
-            # Initial response fragment (embedded in update_session data)
             if isinstance(v, dict) and "response" in v:
                 fragments = v["response"].get("fragments") or []
                 for frag in fragments:
                     content = frag.get("content")
                     if isinstance(content, str) and content:
-                        yield {"type": "content", "text": content}
+                        content_buf += content
                 continue
 
-            # Content: response/fragments/-1/content with APPEND or implicit continue
             if current_path == "response/fragments/-1/content" and isinstance(v, str):
-                yield {"type": "content", "text": v}
-            # Thinking: response/fragments/-1/thinking with APPEND
+                content_buf += v
+                # Check for tool call markers
+                if "<|tool_call|>" in content_buf:
+                    before, rest = content_buf.split("<|tool_call|>", 1)
+                    if before.strip():
+                        yield {"type": "content", "text": before}
+                    if "</|tool_call|>" in rest:
+                        tc_json, after = rest.split("</|tool_call|>", 1)
+                        try:
+                            tc = json.loads(tc_json.strip())
+                            yield {"type": "tool_call", "name": tc.get("name", ""), "arguments": tc.get("arguments", {})}
+                        except json.JSONDecodeError:
+                            yield {"type": "content", "text": f"<|tool_call|>{tc_json}</|tool_call|>"}
+                        content_buf = after
+                    else:
+                        content_buf = "<|tool_call|>" + rest
+                elif "</|tool_call|>" in content_buf and "<|tool_call|>" not in content_buf:
+                    content_buf = ""
+
             elif current_path.startswith("response/fragments/-1/thinking") and isinstance(v, str):
                 yield {"type": "thinking", "text": v}
-            # Search status
             elif current_path == "response/search_status" and isinstance(v, str):
                 yield {"type": "search_status", "status": v}
-            # Search results
             elif current_path == "response/search_results" and isinstance(v, list):
                 yield {"type": "search_results", "results": v}
-            # Finished status
             elif current_path == "response/status" and v == "FINISHED":
-                pass  # done event will come via event:close
-            # Batch with status
+                pass
             elif current_path == "response" and o == "BATCH" and isinstance(v, list):
                 for item in v:
                     if item.get("p") == "quasi_status" and item.get("v") == "FINISHED":
                         pass  # quasi finish
+
+
+def _extract_tool_calls(text: str) -> list[dict]:
+    """Extract any remaining <|tool_call|> blocks from buffered text."""
+    results = []
+    remaining = text
+    while "<|tool_call|>" in remaining and "</|tool_call|>" in remaining:
+        _, rest = remaining.split("<|tool_call|>", 1)
+        tc_json, after = rest.split("</|tool_call|>", 1)
+        try:
+            tc = json.loads(tc_json.strip())
+            results.append({"type": "tool_call", "name": tc.get("name", ""), "arguments": tc.get("arguments", {})})
+        except json.JSONDecodeError:
+            pass
+        remaining = after
+    return results

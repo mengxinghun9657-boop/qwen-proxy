@@ -74,9 +74,10 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
 
     ds = await _get_ds_client()
 
-    # Extract system + user messages
+    # Extract system + user messages + tools
     system = None
     user_content = None
+    tools = body.get("tools")  # OpenAI tool definitions
     for m in messages:
         if m["role"] == "system":
             system = m["content"]
@@ -88,8 +89,10 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
     if user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
 
-    if system:
+    if system and not tools:
         user_content = f"[System: {system}]\n\n{user_content}"
+    elif system:
+        user_content = f"{system}\n\n{user_content}"
 
     # Conversation management
     _cleanup_stale()
@@ -119,6 +122,7 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
             prompt=user_content,
             parent_message_id=parent_message_id,
             thinking=True if "reasoner" in model or "r1" in model else False,
+            tools=tools,
         ):
             if ev["type"] == "content":
                 chunk = {
@@ -129,6 +133,18 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
                     "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif ev["type"] == "tool_call":
+                tc_id = f"call_{uuid.uuid4().hex[:12]}"
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": tc_id, "type": "function", "function": {"name": ev["name"], "arguments": json.dumps(ev["arguments"], ensure_ascii=False)}}]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif ev["type"] == "thinking":
+                pass  # skip thinking in tool mode to keep output clean
             elif ev["type"] == "done":
                 # Update parent_message_id for next turn
                 if ev.get("message_id"):
@@ -156,20 +172,43 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
 
     # Non-streaming: accumulate
     full_content = ""
+    tool_calls = []
     final_msg_id = None
     async for ev in ds.stream_completion(
         session_id=session_id,
         prompt=user_content,
         parent_message_id=parent_message_id,
         thinking=True if "reasoner" in model or "r1" in model else False,
+        tools=tools,
     ):
         if ev["type"] == "content":
             full_content += ev["text"]
+        elif ev["type"] == "tool_call":
+            tc_id = f"call_{uuid.uuid4().hex[:12]}"
+            tool_calls.append({
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": ev["name"], "arguments": json.dumps(ev["arguments"], ensure_ascii=False)},
+            })
         elif ev["type"] == "done":
             if ev.get("message_id"):
                 parent_message_id = ev["message_id"]
                 _ds_conversations[conv_id]["parent_message_id"] = ev["message_id"]
             _ds_conversations[conv_id]["session_id"] = ev.get("session_id", session_id)
+
+    if tool_calls:
+        return JSONResponse({
+            "id": response_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }, headers={"x-conversation-id": conv_id})
 
     return JSONResponse({
         "id": response_id,

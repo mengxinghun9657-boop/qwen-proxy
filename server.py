@@ -161,6 +161,7 @@ Continue the task. You are the SAME assistant as above. The tools results above 
 
     async def sse_stream() -> AsyncGenerator[str, None]:
         nonlocal parent_message_id
+        estimated_tokens = 0
         async for ev in ds.stream_completion(
             session_id=session_id,
             prompt=user_content,
@@ -168,23 +169,27 @@ Continue the task. You are the SAME assistant as above. The tools results above 
             thinking=True if "reasoner" in model or "r1" in model else False,
             tools=tools,
         ):
+            # Build estimated usage for progress tracking
+            est_usage = {"prompt_tokens": 0, "completion_tokens": estimated_tokens, "total_tokens": estimated_tokens}
             if ev["type"] == "content":
+                estimated_tokens += max(1, len(ev["text"]) // 4)
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}], "usage": est_usage,
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif ev["type"] == "tool_call":
+                estimated_tokens += max(1, len(ev.get("name", "")) // 4 + len(str(ev.get("arguments", {}))) // 8)
                 tc_id = f"call_{uuid.uuid4().hex[:12]}"
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": tc_id, "type": "function", "function": {"name": ev["name"], "arguments": json.dumps(ev["arguments"], ensure_ascii=False)}}]}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": tc_id, "type": "function", "function": {"name": ev["name"], "arguments": json.dumps(ev["arguments"], ensure_ascii=False)}}]}, "finish_reason": None}], "usage": est_usage,
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif ev["type"] == "thinking":
@@ -203,6 +208,7 @@ Continue the task. You are the SAME assistant as above. The tools results above 
             "created": created,
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": estimated_tokens, "total_tokens": estimated_tokens},
         }
         yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
@@ -310,6 +316,7 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
 
     async def sse_stream() -> AsyncGenerator[str, None]:
         full_content = ""
+        estimated_tokens = 0
         async for ev in mm.stream_completion(
             messages=history_messages,
             model=model,
@@ -325,7 +332,7 @@ async def _chat_completions_minimax(body: dict, stream: bool, conv_id: str | Non
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"content": ev["text"]}, "finish_reason": None}], "usage": est_usage,
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif ev["type"] == "thinking":

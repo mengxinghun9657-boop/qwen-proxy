@@ -114,9 +114,15 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
     if last_user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
 
-    # Cap transcript to last 20 messages to avoid context overflow
-    if len(transcript_parts) > 20:
-        transcript_parts = transcript_parts[-20:]
+    # Smart transcript management to prevent context overflow
+    MAX_ITEMS = 15
+    if len(transcript_parts) > MAX_ITEMS:
+        first_user = transcript_parts[0] if transcript_parts[0].startswith("User:") else None
+        recent = transcript_parts[-(MAX_ITEMS - 2):]
+        if first_user:
+            transcript_parts = [first_user, "[... earlier turns summarized — continue from recent context below ...]"] + recent
+        else:
+            transcript_parts = ["[... earlier turns ...]"] + recent
 
     # Build the final prompt
     if len(transcript_parts) <= 1:
@@ -142,13 +148,23 @@ Continue the task. You are the SAME assistant as above. The tools results above 
 
     user_content = final_prompt
 
-    # Conversation management
+    # Conversation management with session refresh
     _cleanup_stale()
+    SESSION_MAX_TURNS = 8  # refresh DeepSeek session after N turns to avoid timeout
     if conv_id and conv_id in _ds_conversations:
         conv = _ds_conversations[conv_id]
-        session_id = conv["session_id"]
-        parent_message_id = conv.get("parent_message_id")
-        # Restore cached tools from previous turns
+        conv["msg_count"] += 1
+        # Refresh session periodically to avoid timeout/context issues
+        if conv["msg_count"] > SESSION_MAX_TURNS:
+            session_id = await ds.create_session()
+            parent_message_id = None
+            conv["session_id"] = session_id
+            conv["parent_message_id"] = None
+            conv["msg_count"] = 0
+            conv["created_at"] = time.time()
+        else:
+            session_id = conv["session_id"]
+            parent_message_id = conv.get("parent_message_id")
         if tools is None:
             tools = conv.get("cached_tools")
     else:

@@ -137,18 +137,27 @@ class DeepSeekClient:
             param_list = ", ".join(f"{k}({v.get('description','')})" for k, v in props.items())
             tool_descs.append(f"- {name}: {desc} [{param_list}]")
 
-        return f"""You have access to these tools:
+        return f"""## TOOLS
+
+You have these tools available. You MUST use them — do NOT describe what you would do.
 
 {"\n".join(tool_descs)}
 
-When you need to execute a tool, respond with this JSON on a SINGLE LINE by itself:
+## RESPONSE FORMAT
 
-{{"tool": "<tool_name>", "args": {{...}}}}
+To call a tool, output EXACTLY this JSON on its own line with nothing else:
 
-For example: {{"tool": "terminal", "args": {{"command": "docker --version"}}}}
+{{"tool": "<name>", "args": {{...}}}}
 
-After the tool result, continue with the next action or respond to the user.
-Always execute tools directly rather than describing what you would do."""
+Example: {{"tool": "terminal", "args": {{"command": "docker --version"}}}}
+
+## RULES
+
+1. NEVER output text that describes what you will do. ALWAYS call the tool directly.
+2. NEVER output bash code blocks. ALWAYS use {{"tool": "terminal", ...}} instead.
+3. NEVER ask the user to run commands. Execute them yourself immediately.
+4. Your first response to any task MUST be a tool call, not an explanation.
+5. After receiving a tool result, immediately call the next tool. No commentary."""
 
     async def stream_completion(
         self,
@@ -173,7 +182,7 @@ Always execute tools directly rather than describing what you would do."""
             "parent_message_id": parent_message_id,
             "prompt": final_prompt,
             "ref_file_ids": [],
-            "thinking_enabled": thinking,
+            "thinking_enabled": False if tools else thinking,
             "search_enabled": search,
         }
 
@@ -284,15 +293,16 @@ async def _parse_stream(r: httpx.Response) -> AsyncIterator[dict[str, Any]]:
 
             if current_path == "response/fragments/-1/content" and isinstance(v, str):
                 content_buf += v
-                # Try to extract tool calls: look for {"tool": ...} on its own line
+                # Try to extract tool calls
                 tc = _try_extract_tool_call(content_buf)
                 if tc:
                     if tc["_before"].strip():
                         yield {"type": "content", "text": tc["_before"]}
                     yield {"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]}
                     content_buf = tc["_after"]
-                # Flush safe content periodically
-                elif len(content_buf) > 80 and "tool" not in content_buf[-40:]:
+                # Flush only if clearly not a tool call (no opening brace pending)
+                elif len(content_buf) > 200 and "tool" not in content_buf:
+                    # Safe to flush - no tool call pattern at all
                     yield {"type": "content", "text": content_buf}
                     content_buf = ""
 

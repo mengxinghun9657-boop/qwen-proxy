@@ -98,11 +98,15 @@ async def _chat_completions_deepseek(body: dict, stream: bool, conv_id: str | No
             if tc:
                 for t in tc:
                     fn = t.get("function", {})
-                    transcript_parts.append(f"Assistant called {fn.get('name')}({fn.get('arguments')})")
+                    try:
+                        args = json.loads(fn.get('arguments', '{}'))
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    transcript_parts.append(json.dumps({"tool": fn.get("name", "?"), "args": args}, ensure_ascii=False))
             elif content:
                 transcript_parts.append(f"Assistant: {content}")
         elif role == "tool":
-            transcript_parts.append(f"Tool result (id={m.get('tool_call_id', '?')}): {content}")
+            transcript_parts.append(f"Tool result: {content}")
 
     if last_user_content is None:
         raise HTTPException(400, detail={"error": {"message": "No user message found", "type": "invalid_request"}})
